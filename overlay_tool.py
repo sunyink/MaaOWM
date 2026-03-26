@@ -39,7 +39,7 @@ from core.writer import write_back, WriteResult
 #  常量与状态
 # ============================================================
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 STATE_IDLE = "空闲"
 STATE_LOADED = "配置已加载"
@@ -77,7 +77,7 @@ HELP_TEXT = """\
 [bold]注意事项:[/bold]
   - 工作区活跃期间请勿切换 Git 分支修改 base 层
   - 如需禁用整个节点，请手动在覆盖包中添加 "enabled": false
-  - Pipeline Diff 基于 v1 扁平结构，按字段语义比对（非文本行比对）\
+  - Pipeline Diff 基于语义比对，兼容 v1 扁平和 v2 嵌套结构\
 """
 
 # ============================================================
@@ -179,6 +179,101 @@ class OverlayToolApp:
 
         return always
 
+    # --- Diff 摘要渲染 ---
+
+    def _render_diff_summary(self, diff_result: DiffResult):
+        """用 Rich Table 渲染差异摘要，高亮变更项并列对齐。"""
+
+        has_any_output = False
+
+        # === Pipeline 摘要表 ===
+        if diff_result.pipeline_diffs:
+            has_any_output = True
+
+            tbl = Table(
+                title="[bold]Pipeline[/bold]",
+                title_style="",
+                box=box.SIMPLE_HEAD,
+                show_edge=False,
+                pad_edge=False,
+                padding=(0, 1),
+                expand=False,
+            )
+            tbl.add_column("", width=2, no_wrap=True)                       # 状态标记
+            tbl.add_column("文件", style="white", no_wrap=True)             # 文件路径
+            tbl.add_column("修改", justify="right", no_wrap=True)           # 修改数
+            tbl.add_column("新增", justify="right", no_wrap=True)           # 新增数
+            tbl.add_column("无变化", justify="right", style="dim", no_wrap=True)
+
+            total_mod = total_new = total_unch = 0
+
+            for rel_path, diff_info in diff_result.pipeline_diffs.items():
+                mod = len(diff_info.modified_nodes)
+                new = len(diff_info.new_nodes)
+                unch = diff_info.unchanged_count
+                total_mod += mod
+                total_new += new
+                total_unch += unch
+
+                # 状态标记：有变更为亮色圆点，无变更为暗色圆圈
+                if diff_info.has_changes:
+                    marker = "[bold yellow]●[/]"
+                else:
+                    marker = "[dim]○[/]"
+
+                # 修改列：有修改时高亮黄色加粗
+                mod_cell = f"[bold yellow]{mod}[/]" if mod else "[dim]-[/]"
+                # 新增列：有新增时高亮绿色加粗
+                new_cell = f"[bold green]{new}[/]" if new else "[dim]-[/]"
+                # 无变化列
+                unch_cell = str(unch) if unch else "-"
+
+                tbl.add_row(marker, rel_path, mod_cell, new_cell, unch_cell)
+
+            # 合计行
+            tbl.add_section()
+            total_mod_cell = f"[bold yellow]{total_mod}[/]" if total_mod else "[dim]0[/]"
+            total_new_cell = f"[bold green]{total_new}[/]" if total_new else "[dim]0[/]"
+            total_unch_cell = f"[dim]{total_unch}[/]"
+            tbl.add_row(
+                "",
+                "[bold]合计[/]",
+                total_mod_cell,
+                total_new_cell,
+                total_unch_cell,
+            )
+
+            self.console.print(tbl)
+            self.console.print()
+
+        # === Image / Model 摘要 ===
+        for res_type, bin_diff in [
+            ("Image", diff_result.image_diff),
+            ("Model", diff_result.model_diff),
+        ]:
+            if not (bin_diff.new_files or bin_diff.modified_files or bin_diff.unchanged_files):
+                continue
+
+            has_any_output = True
+            parts = []
+            if bin_diff.modified_files:
+                parts.append(f"[bold yellow]修改 {len(bin_diff.modified_files)}[/]")
+            if bin_diff.new_files:
+                parts.append(f"[bold green]新增 {len(bin_diff.new_files)}[/]")
+            if bin_diff.unchanged_files:
+                parts.append(f"[dim]剔除 {len(bin_diff.unchanged_files)}[/]")
+            self.console.print(f"  [bold]{res_type}[/]  {' │ '.join(parts)}")
+
+        # === 错误 ===
+        if diff_result.errors:
+            has_any_output = True
+            self.console.print(f"\n  [bold red]错误[/] {len(diff_result.errors)} 个")
+            for err in diff_result.errors:
+                self.console.print(f"  [red]![/] {err}")
+
+        if not has_any_output:
+            self.console.print("[yellow]未检测到任何差异。[/yellow]")
+
     # --- 操作实现 ---
 
     def _load_config(self):
@@ -255,17 +350,10 @@ class OverlayToolApp:
             self.console.print("[red]配置未加载[/red]")
             return
 
-        self.console.print("[dim]正在计算差异...[/dim]")
+        self.console.print("[dim]正在计算差异...[/dim]\n")
         self.diff_result = compute_diff(self.config)
 
-        summary_lines = self.diff_result.summary_lines()
-        if summary_lines:
-            self.console.print()
-            for line in summary_lines:
-                self.console.print(line)
-            self.console.print()
-        else:
-            self.console.print("[yellow]未检测到任何差异。[/yellow]")
+        self._render_diff_summary(self.diff_result)
 
         self.state = STATE_DIFF_READY
         self.console.print(
@@ -281,12 +369,9 @@ class OverlayToolApp:
             return
 
         # 再次展示摘要
-        summary_lines = self.diff_result.summary_lines()
-        if summary_lines:
-            self.console.print("[bold]即将写入以下变更:[/bold]")
-            for line in summary_lines:
-                self.console.print(line)
-            self.console.print()
+        self.console.print("[bold]即将写入以下变更:[/bold]\n")
+        self._render_diff_summary(self.diff_result)
+        self.console.print()
 
         target_path = self.config.target_path
         if not Confirm.ask(
