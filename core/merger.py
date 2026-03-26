@@ -19,16 +19,42 @@ from .config import OverlayConfig
 
 def deep_merge_node(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     """
-    节点级字段合并（v1 扁平结构）。
+    节点级字段合并，兼容 v1 扁平结构和 v2 嵌套结构。
 
-    overlay 的字段直接覆盖 base 的同名字段。
-    base 中有但 overlay 中没有的字段保留。
+    基本规则：overlay 的字段覆盖 base 的同名字段，base 独有字段保留。
 
-    NOTE: 当前为 v1 扁平策略。未来升级 v2 时，可在此处对
-          'recognition' 和 'action' 字段做递归 dict merge。
+    v2 特殊处理：当 recognition / action 字段在 base 和 overlay 中都是 dict 时，
+    对其内部的 param 子字典做递归 merge，避免 overlay 只改一个 param 参数
+    就丢失 base 的其他 param 参数。
+
+    注意：v1 和 v2 可在同一文件内混用（不同节点），但同一节点内不混用。
+    当 base 和 overlay 的 recognition/action 类型不一致时（一个 str 一个 dict），
+    以 overlay 为准直接替换。
     """
     merged = dict(base)
-    merged.update(overlay)
+
+    for key, overlay_val in overlay.items():
+        # v2 嵌套结构：recognition / action 为 dict 时做深度合并
+        if key in ("recognition", "action"):
+            base_val = merged.get(key)
+            if isinstance(base_val, dict) and isinstance(overlay_val, dict):
+                merged_field = dict(base_val)
+                for sub_key, sub_val in overlay_val.items():
+                    if (
+                        sub_key == "param"
+                        and isinstance(sub_val, dict)
+                        and isinstance(merged_field.get("param"), dict)
+                    ):
+                        # param 子字典递归 merge
+                        merged_field["param"] = {**merged_field["param"], **sub_val}
+                    else:
+                        merged_field[sub_key] = sub_val
+                merged[key] = merged_field
+                continue
+
+        # v1 或非 recognition/action 字段：直接替换
+        merged[key] = overlay_val
+
     return merged
 
 

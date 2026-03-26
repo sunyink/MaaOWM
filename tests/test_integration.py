@@ -106,6 +106,54 @@ def setup_test_dirs():
     (base_image / "fishing_icon.png").write_bytes(b"FAKE_PNG_BASE_FISHING")
     (base_image / "fish_caught.png").write_bytes(b"FAKE_PNG_BASE_CAUGHT")
 
+    # base/pipeline/v2_mixed.json — v1/v2 混用测试
+    (base_pipeline / "v2_mixed.json").write_text(
+        json.dumps(
+            {
+                # v2 格式节点
+                "V2TemplateNode": {
+                    "recognition": {
+                        "type": "TemplateMatch",
+                        "param": {
+                            "template": "icon.png",
+                            "threshold": 0.7,
+                            "order_by": "Horizontal",
+                        },
+                    },
+                    "action": {
+                        "type": "Click",
+                        "param": {
+                            "target": True,
+                        },
+                    },
+                    "next": ["V1SimpleNode"],
+                    "timeout": 20000,
+                },
+                # v1 格式节点（同文件混用）
+                "V1SimpleNode": {
+                    "recognition": "OCR",
+                    "expected": "确认",
+                    "action": "Click",
+                },
+                # 另一个 v2 节点
+                "V2OcrNode": {
+                    "recognition": {
+                        "type": "OCR",
+                        "param": {
+                            "expected": ["开始", "Start"],
+                            "threshold": 0.3,
+                        },
+                    },
+                    "action": {"type": "DoNothing"},
+                    "next": [],
+                },
+            },
+            ensure_ascii=False,
+            indent=4,
+        ),
+        encoding="utf-8",
+    )
+
     # === PC 覆盖层（初始状态：有一些覆盖） ===
     pc_pipeline = TEST_DIR / "PC" / "pipeline"
     pc_pipeline.mkdir(parents=True)
@@ -149,6 +197,25 @@ def setup_test_dirs():
     pc_image = TEST_DIR / "PC" / "image"
     pc_image.mkdir(parents=True)
     (pc_image / "fishing_icon.png").write_bytes(b"FAKE_PNG_PC_FISHING_DIFFERENT")
+
+    # PC 端 v2_mixed.json：只覆盖 v2 节点的部分 param
+    (pc_pipeline / "v2_mixed.json").write_text(
+        json.dumps(
+            {
+                "V2TemplateNode": {
+                    "recognition": {
+                        "param": {
+                            "threshold": 0.9,  # 只改阈值，template 和 order_by 应继承 base
+                        },
+                    },
+                    "timeout": 30000,  # 也改了一个 v1 风格的扁平字段
+                },
+            },
+            ensure_ascii=False,
+            indent=4,
+        ),
+        encoding="utf-8",
+    )
 
     # === 配置文件 ===
     config_data = {
@@ -222,7 +289,41 @@ def test_forward_merge(config):
     assert base_login == b"FAKE_PNG_BASE_LOGIN", "login_btn 应继承 base"
     print("  ✓ image 文件继承正确")
 
-    print("\n  [PASS] 正向合并全部通过")
+    # === v2 混用测试 ===
+    with open(ws / "pipeline" / "v2_mixed.json", "r", encoding="utf-8") as f:
+        v2_mixed = json.load(f)
+
+    # V2TemplateNode: PC 只覆盖了 threshold，其余 param 应继承 base
+    v2t = v2_mixed["V2TemplateNode"]
+    rec = v2t["recognition"]
+    assert isinstance(rec, dict), "v2 的 recognition 应为 dict"
+    assert rec["type"] == "TemplateMatch", "type 应继承 base"
+    assert rec["param"]["threshold"] == 0.9, "threshold 应为 PC 覆盖值 0.9"
+    assert rec["param"]["template"] == "icon.png", "template 应继承 base（不被覆盖丢失）"
+    assert rec["param"]["order_by"] == "Horizontal", "order_by 应继承 base"
+    print("  ✓ V2TemplateNode recognition.param 深度合并正确")
+
+    # action 应完整继承 base（PC 未覆盖 action）
+    assert v2t["action"] == {"type": "Click", "param": {"target": True}}, "action 应完整继承"
+    # timeout 应为 PC 覆盖值
+    assert v2t["timeout"] == 30000, "timeout 应为 PC 覆盖值"
+    # next 应继承 base
+    assert v2t["next"] == ["V1SimpleNode"], "next 应继承 base"
+    print("  ✓ V2TemplateNode 扁平字段合并正确")
+
+    # V1SimpleNode: 同文件的 v1 节点应正常继承（PC 未覆盖）
+    v1s = v2_mixed["V1SimpleNode"]
+    assert v1s["recognition"] == "OCR", "v1 节点 recognition 应为字符串"
+    assert v1s["expected"] == "确认", "v1 节点应完整继承 base"
+    print("  ✓ V1SimpleNode（同文件 v1 节点）正常继承")
+
+    # V2OcrNode: PC 未覆盖，应完整继承
+    v2o = v2_mixed["V2OcrNode"]
+    assert v2o["recognition"]["type"] == "OCR", "V2OcrNode 应完整继承"
+    assert v2o["recognition"]["param"]["expected"] == ["开始", "Start"]
+    print("  ✓ V2OcrNode 完整继承 base")
+
+    print("\n  [PASS] 正向合并全部通过（含 v2 混用）")
 
 
 def test_diff_no_edit(config):
@@ -266,7 +367,35 @@ def test_diff_no_edit(config):
     assert "image/login_btn.png" in diff.image_diff.unchanged_files, "login_btn 应为无变化"
     print("  ✓ image diff 正确")
 
-    print("\n  [PASS] 无编辑 Diff 全部通过")
+    # === v2 混用 diff 测试 ===
+    v2_diff = diff.pipeline_diffs.get("pipeline/v2_mixed.json")
+    assert v2_diff is not None, "v2_mixed.json 应存在于 diff 结果中"
+
+    # V2TemplateNode 应检测到差异（threshold + timeout）
+    assert "V2TemplateNode" in v2_diff.modified_nodes, "V2TemplateNode 应有差异"
+    v2t_diff = v2_diff.modified_nodes["V2TemplateNode"]
+
+    # recognition diff 应输出最小增量（仅变化的 param 子字段）
+    assert "recognition" in v2t_diff, "recognition 应在 diff 中"
+    rec_diff = v2t_diff["recognition"]
+    assert isinstance(rec_diff, dict), "v2 recognition diff 应为 dict"
+    assert "type" not in rec_diff, "type 未变化，不应在 diff 中"
+    assert rec_diff == {"param": {"threshold": 0.9}}, \
+        f"recognition diff 应仅含变化的 param 子字段, got {rec_diff}"
+    print("  ✓ V2TemplateNode recognition diff 输出最小增量")
+
+    # timeout diff
+    assert v2t_diff.get("timeout") == 30000, "timeout 应在 diff 中"
+    # action 和 next 不应出现（未变化）
+    assert "action" not in v2t_diff, "action 未变化不应在 diff 中"
+    assert "next" not in v2t_diff, "next 未变化不应在 diff 中"
+    print("  ✓ V2TemplateNode 扁平字段 diff 正确")
+
+    # V1SimpleNode 应无差异
+    assert v2_diff.unchanged_count >= 2, "V1SimpleNode 和 V2OcrNode 应无差异"
+    print("  ✓ 同文件 v1/v2 未修改节点正确剔除")
+
+    print("\n  [PASS] 无编辑 Diff 全部通过（含 v2 混用）")
 
 
 def test_diff_after_edit(config):
@@ -297,6 +426,16 @@ def test_diff_after_edit(config):
     with open(ws / "pipeline" / "fishing.json", "w", encoding="utf-8") as f:
         json.dump(fishing, f, ensure_ascii=False, indent=4)
 
+    # 模拟编辑：修改 v2_mixed.json 中的 v2 节点
+    with open(ws / "pipeline" / "v2_mixed.json", "r", encoding="utf-8") as f:
+        v2_mixed = json.load(f)
+
+    # 4. 修改 V2OcrNode 的 param.expected（v2 嵌套字段）
+    v2_mixed["V2OcrNode"]["recognition"]["param"]["expected"] = ["开始", "Start", "Начать"]
+
+    with open(ws / "pipeline" / "v2_mixed.json", "w", encoding="utf-8") as f:
+        json.dump(v2_mixed, f, ensure_ascii=False, indent=4)
+
     # 执行 Diff
     diff = compute_diff(config)
     for line in diff.summary_lines():
@@ -320,7 +459,22 @@ def test_diff_after_edit(config):
     assert "PCOnlyNode" in fishing_diff.new_nodes
     print("  ✓ PCOnlyNode 新增节点检测正确")
 
-    print("\n  [PASS] 编辑后 Diff 全部通过")
+    # === v2 编辑 diff ===
+    v2_diff = diff.pipeline_diffs["pipeline/v2_mixed.json"]
+
+    # V2OcrNode 应检测到 recognition 变化
+    assert "V2OcrNode" in v2_diff.modified_nodes, "V2OcrNode 应有差异"
+    v2o_diff = v2_diff.modified_nodes["V2OcrNode"]
+    # 应输出最小增量的 recognition diff（仅变化的 param 子字段）
+    assert "recognition" in v2o_diff
+    assert v2o_diff["recognition"] == {"param": {"expected": ["开始", "Start", "Начать"]}}, \
+        f"recognition diff 应仅含变化的 param.expected, got {v2o_diff['recognition']}"
+    assert "type" not in v2o_diff["recognition"], "type 未变化不应在 diff 中"
+    # action 未变化不应出现
+    assert "action" not in v2o_diff, "action 未变不应在 diff 中"
+    print("  ✓ V2OcrNode v2 嵌套字段编辑 diff 正确（最小增量）")
+
+    print("\n  [PASS] 编辑后 Diff 全部通过（含 v2 混用）")
 
 
 def test_write_back(config):

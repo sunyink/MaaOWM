@@ -39,7 +39,7 @@ from core.writer import write_back, WriteResult
 #  常量与状态
 # ============================================================
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 STATE_IDLE = "空闲"
 STATE_LOADED = "配置已加载"

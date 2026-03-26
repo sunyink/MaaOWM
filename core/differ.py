@@ -55,9 +55,15 @@ class PipelineDiffStrategy(ABC):
 
 class PipelineDiffV1(PipelineDiffStrategy):
     """
-    v1 扁平结构比对策略。
+    节点字段级比对策略，兼容 v1 和 v2。
 
-    所有字段都在节点根级别，逐字段 == 比对。
+    逐字段使用 Python == 比对（对 dict/list 做深度比较）。
+    - v1 字段（str/int/list 等）：逐字段提取差异值。
+    - v2 字段（recognition/action 为 dict）：深度比对其内部结构，
+      仅输出有变化的子字段。与 merger 的 deep_merge_node 逻辑对称，
+      确保覆盖包最小化且合并后能还原完整节点。
+
+    同一文件内 v1/v2 节点可混用，比对逻辑自动适配。
     """
 
     def diff_node(
@@ -75,7 +81,15 @@ class PipelineDiffV1(PipelineDiffStrategy):
                 diff_fields[key] = ws_value
             elif ws_value != base_node[key]:
                 # 字段值变化
-                diff_fields[key] = ws_value
+                if key in ("recognition", "action") and \
+                        isinstance(ws_value, dict) and isinstance(base_node[key], dict):
+                    # V2 嵌套结构：深度 diff，与 merger.deep_merge_node 对称
+                    v2_diff = _diff_v2_field(ws_value, base_node[key])
+                    if v2_diff:
+                        diff_fields[key] = v2_diff
+                else:
+                    # V1 或普通字段：直接输出变化值
+                    diff_fields[key] = ws_value
 
         # 2. 检查删除的字段（base 有但工作区没有）
         for key in base_node:
@@ -89,28 +103,70 @@ class PipelineDiffV1(PipelineDiffStrategy):
         return diff_fields
 
 
-# --- 未来扩展示例（v2 嵌套结构） ---
-#
-# class PipelineDiffV2(PipelineDiffStrategy):
-#     """
-#     v2 嵌套结构比对策略。
-#
-#     对 'recognition' 和 'action' 字段，若为 dict 类型，
-#     递归进入 'param' 做深层比对。
-#     """
-#     def diff_node(self, node_name, workspace_node, base_node):
-#         diff_fields = {}
-#         for key, ws_value in workspace_node.items():
-#             base_value = base_node.get(key)
-#             if key in ("recognition", "action") and isinstance(ws_value, dict) and isinstance(base_value, dict):
-#                 # 递归比对 type + param
-#                 inner_diff = self._diff_nested(ws_value, base_value)
-#                 if inner_diff:
-#                     diff_fields[key] = inner_diff
-#             elif ws_value != base_value:
-#                 diff_fields[key] = ws_value
-#         # ... 处理删除 ...
-#         return diff_fields or None
+def _diff_v2_field(
+    ws_field: Dict[str, Any],
+    base_field: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    深度比对 V2 的 recognition / action 字典。
+
+    与 merger.deep_merge_node 中对 recognition/action 的合并逻辑严格对称：
+    - type: 直接比较，变化则输出
+    - param: 当两边都是 dict 时，逐 key 比较，仅输出变化的 param key
+    - 其他子字段: 直接比较，变化则输出
+
+    Returns:
+        有差异的子字段字典，或 None（完全无差异）。
+    """
+    diff: Dict[str, Any] = {}
+
+    # 1. 检查修改和新增的子字段
+    for sub_key, ws_val in ws_field.items():
+        if sub_key not in base_field:
+            # 新增子字段
+            diff[sub_key] = ws_val
+        elif ws_val != base_field[sub_key]:
+            if sub_key == "param" and \
+                    isinstance(ws_val, dict) and isinstance(base_field[sub_key], dict):
+                # param 子字典：逐 key 比对，与 merger 的 param 递归 merge 对称
+                param_diff = _diff_dict_shallow(ws_val, base_field[sub_key])
+                if param_diff:
+                    diff["param"] = param_diff
+            else:
+                # type 或其他子字段：直接输出变化值
+                diff[sub_key] = ws_val
+
+    # 2. 检查删除的子字段
+    for sub_key in base_field:
+        if sub_key not in ws_field:
+            diff[sub_key] = _get_empty_value(sub_key, base_field[sub_key])
+
+    return diff if diff else None
+
+
+def _diff_dict_shallow(
+    ws_dict: Dict[str, Any],
+    base_dict: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    浅层 dict 比对，用于 param 级别。
+
+    逐 key 比较，仅输出有变化或新增的 key。
+    对于被删除的 key，输出对应类型的空值标记。
+    """
+    diff: Dict[str, Any] = {}
+
+    for key, ws_val in ws_dict.items():
+        if key not in base_dict:
+            diff[key] = ws_val
+        elif ws_val != base_dict[key]:
+            diff[key] = ws_val
+
+    for key in base_dict:
+        if key not in ws_dict:
+            diff[key] = _get_empty_value(key, base_dict[key])
+
+    return diff if diff else None
 
 
 def _get_empty_value(field_name: str, original_value: Any) -> Any:
