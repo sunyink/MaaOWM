@@ -1,94 +1,204 @@
 """
-配置加载与路径解析模块。
+core/config.py — 配置加载与校验
 
-支持绝对路径和相对路径（相对于配置文件所在目录）。
+overlay_config.json 字段:
+  target          : 必填, mod 包目录 (相对配置文件位置, 或绝对路径)
+  base_layers     : 必填, base 包目录列表 (按顺序加载, 后者覆盖前者)
+  maa_pkg_dir     : 选填, 显式 site-packages/maa 目录 (覆盖自动检测)
+  
+路径规则:
+  - 支持绝对路径和相对路径 (相对配置文件位置)
+  - 支持 ../ 向上导航
 """
 
+from __future__ import annotations
+
+import dataclasses
 import json
-from pathlib import Path
-from dataclasses import dataclass, field
+import pathlib
+import sys
+import tempfile
 from typing import List, Optional
 
 
-@dataclass
+@dataclasses.dataclass
 class OverlayConfig:
-    """覆盖包工作区配置。"""
+    config_path: pathlib.Path                    # 配置文件本身的路径
+    config_root: pathlib.Path                    # 配置文件所在目录
+    target_path: pathlib.Path                    # mod 包目录 (绝对)
+    base_layer_paths_resolved: List[pathlib.Path]  # base 目录列表 (绝对)
+    maa_pkg_dir: Optional[pathlib.Path]          # 显式 maa 包目录 (绝对)
 
-    workspace_dir: str = ".workspace"
-    target: str = ""
-    base_layers: List[str] = field(default_factory=list)
-    resource_types: List[str] = field(
-        default_factory=lambda: ["pipeline", "image", "model"]
-    )
-
-    # --- 运行时解析后的绝对路径 (不序列化) ---
-    config_root: Path = field(default_factory=lambda: Path("."), repr=False)
-
-    def resolve_path(self, raw_path: str) -> Path:
-        """将路径解析为绝对路径。若已是绝对路径则直接返回，否则相对于配置文件目录。"""
-        p = Path(raw_path)
-        if p.is_absolute():
-            return p
-        return (self.config_root / p).resolve()
+    def base_layer_paths(self) -> List[pathlib.Path]:
+        return self.base_layer_paths_resolved
 
     @property
-    def workspace_path(self) -> Path:
-        return self.resolve_path(self.workspace_dir)
+    def owm_dir(self) -> pathlib.Path:
+        """目标 mod 包同级的 .maaowm/ 目录, 存快照、备份、日志。"""
+        return self.target_path.parent / ".maaowm"
 
     @property
-    def target_path(self) -> Path:
-        return self.resolve_path(self.target)
+    def workspace_dir(self) -> pathlib.Path:
+        """工作区目录就是目标 mod 包目录本身 (inplace 模式)。"""
+        return self.target_path
 
-    def base_layer_paths(self) -> List[Path]:
-        return [self.resolve_path(layer) for layer in self.base_layers]
+    @property
+    def pipeline_subdir(self) -> str:
+        """Pipeline 子目录名 (MaaFW 约定)。"""
+        return "pipeline"
+
+    def workspace_pipeline_dir(self) -> pathlib.Path:
+        """工作区中 pipeline 子目录的路径。"""
+        return self.workspace_dir / self.pipeline_subdir
+
+    def base_pipeline_dirs(self) -> List[pathlib.Path]:
+        """所有 base 层中 pipeline 子目录的路径列表。"""
+        return [b / self.pipeline_subdir for b in self.base_layer_paths_resolved]
 
     def validate(self) -> List[str]:
-        """校验配置，返回错误信息列表。空列表表示通过。"""
-        errors = []
-
-        if not self.target:
-            errors.append("配置缺少 'target' 字段（目标覆盖包目录）。")
-
-        if not self.base_layers:
-            errors.append("配置缺少 'base_layers' 字段（至少需要一个底层依赖）。")
-
-        for i, layer in enumerate(self.base_layers):
-            path = self.resolve_path(layer)
-            if not path.exists():
-                errors.append(f"base_layers[{i}] 路径不存在: {path}")
-
-        if self.target:
-            target = self.target_path
-            if not target.exists():
-                errors.append(f"target 路径不存在: {target}")
-
-        if not self.resource_types:
-            errors.append("resource_types 不能为空。")
-
-        valid_types = {"pipeline", "image", "model"}
-        for rt in self.resource_types:
-            if rt not in valid_types:
-                errors.append(f"未知的 resource_type: '{rt}'，支持: {valid_types}")
-
-        return errors
+        """返回所有校验错误的字符串列表 (空表示 OK)。"""
+        errs: List[str] = []
+        if not self.target_path.is_dir():
+            errs.append(f"target 目录不存在: {self.target_path}")
+        for b in self.base_layer_paths_resolved:
+            if not b.is_dir():
+                errs.append(f"base layer 目录不存在: {b}")
+        if not self.workspace_pipeline_dir().exists():
+            errs.append(
+                f"target 下没有 pipeline/ 子目录: {self.workspace_pipeline_dir()}\n"
+                f"  MaaFW 约定 pipeline JSON 应放在 <bundle>/pipeline/ 下"
+            )
+        for bp in self.base_pipeline_dirs():
+            if not bp.exists():
+                errs.append(f"base 层下没有 pipeline/ 子目录: {bp}")
+        return errs
 
 
-def load_config(config_path: str | Path) -> OverlayConfig:
-    """从 JSON 文件加载配置。"""
-    config_path = Path(config_path).resolve()
+class ConfigError(Exception):
+    pass
 
-    if not config_path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def _resolve_path(raw: str, config_root: pathlib.Path) -> pathlib.Path:
+    p = pathlib.Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (config_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
 
-    config = OverlayConfig(
-        workspace_dir=data.get("workspace_dir", ".workspace"),
-        target=data.get("target", ""),
-        base_layers=data.get("base_layers", []),
-        resource_types=data.get("resource_types", ["pipeline", "image", "model"]),
-        config_root=config_path.parent,
+
+def load_config(config_path: pathlib.Path) -> OverlayConfig:
+    """读 overlay_config.json, 解析为 OverlayConfig。不做存在性校验, 那是 validate() 的事。"""
+    config_path = config_path.resolve()
+    if not config_path.is_file():
+        raise ConfigError(f"配置文件不存在: {config_path}")
+
+    text = config_path.read_text(encoding="utf-8-sig")
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"配置文件不是合法 JSON: {e}") from None
+
+    if not isinstance(raw, dict):
+        raise ConfigError("配置文件根必须是 object")
+
+    if "target" not in raw or not isinstance(raw["target"], str):
+        raise ConfigError("配置缺少 target 字段 (字符串)")
+    if "base_layers" not in raw or not isinstance(raw["base_layers"], list):
+        raise ConfigError("配置缺少 base_layers 字段 (字符串数组)")
+    if not all(isinstance(x, str) for x in raw["base_layers"]):
+        raise ConfigError("base_layers 必须全是字符串")
+
+    config_root = config_path.parent
+    target_path = _resolve_path(raw["target"], config_root)
+    base_layer_paths = [_resolve_path(b, config_root) for b in raw["base_layers"]]
+
+    maa_pkg_dir: Optional[pathlib.Path] = None
+    if "maa_pkg_dir" in raw and raw["maa_pkg_dir"]:
+        if not isinstance(raw["maa_pkg_dir"], str):
+            raise ConfigError("maa_pkg_dir 必须是字符串")
+        maa_pkg_dir = _resolve_path(raw["maa_pkg_dir"], config_root)
+
+    return OverlayConfig(
+        config_path=config_path,
+        config_root=config_root,
+        target_path=target_path,
+        base_layer_paths_resolved=base_layer_paths,
+        maa_pkg_dir=maa_pkg_dir,
     )
 
-    return config
+
+SAMPLE_CONFIG = {
+    "target": "assets/resource/PC",
+    "base_layers": ["assets/resource/base"],
+    "maa_pkg_dir": None,
+}
+
+
+def write_sample_config(path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(SAMPLE_CONFIG, ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# 自检
+# ============================================================
+
+def _self_test() -> bool:
+    print("config 自检")
+    print("─" * 60)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+
+        # 建假目录结构
+        (root / "assets" / "resource" / "base" / "pipeline").mkdir(parents=True)
+        (root / "assets" / "resource" / "PC" / "pipeline").mkdir(parents=True)
+
+        cfg_path = root / "overlay_config.json"
+        cfg_path.write_text(json.dumps({
+            "target": "assets/resource/PC",
+            "base_layers": ["assets/resource/base"],
+            "maa_pkg_dir": None,
+        }), encoding="utf-8")
+
+        cfg = load_config(cfg_path)
+        errs = cfg.validate()
+        ok = not errs
+        print(f"  target_path:           {cfg.target_path}")
+        print(f"  base_layer_paths:      {cfg.base_layer_paths()}")
+        print(f"  workspace_pipeline:    {cfg.workspace_pipeline_dir()}")
+        print(f"  owm_dir:               {cfg.owm_dir}")
+        print(f"  validate:              {'✓' if ok else '✗'}")
+        if errs:
+            for e in errs:
+                print(f"    ✗ {e}")
+
+        # 测试缺字段
+        bad_path = root / "bad.json"
+        bad_path.write_text('{"target": "x"}', encoding="utf-8")
+        try:
+            load_config(bad_path)
+            print("  缺字段检测:           ✗ (本该报错)")
+            return False
+        except ConfigError:
+            print("  缺字段检测:           ✓")
+
+        # 测试不存在的路径
+        bad2_path = root / "bad2.json"
+        bad2_path.write_text(json.dumps({
+            "target": "nonexistent",
+            "base_layers": ["nonexistent_base"],
+        }), encoding="utf-8")
+        cfg2 = load_config(bad2_path)
+        errs2 = cfg2.validate()
+        print(f"  不存在路径检测:       {'✓' if errs2 else '✗'}")
+
+        return ok
+
+
+if __name__ == "__main__":
+    sys.exit(0 if _self_test() else 1)
