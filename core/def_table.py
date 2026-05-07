@@ -194,12 +194,31 @@ def _probe_one_task(
         return None
 
 
+# 进程级缓存: 同一进程内对同 base_dir 的探针结果只跑一次
+# (探针会触发 MaaFW 的 [ERR] stderr 输出, 缓存后避免反复挂卸载时刷屏)
+_def_tables_cache: Dict[str, DefTables] = {}
+
+
+def clear_def_tables_cache() -> None:
+    """清空进程级缓存 (一般不需要; 测试 / base 路径变化时可手动清)。"""
+    _def_tables_cache.clear()
+
+
 def build_def_tables(base_dir: pathlib.Path, verbose: bool = False) -> DefTables:
     """构建 def 表。探针失败的 type 静默跳过, 写日志。
 
     base_dir: pipeline 目录的绝对路径
     verbose:  True 时打印探针进度 (用于 verify 脚本)
+
+    进程级缓存: 同一 base_dir 在本进程内已探过, 直接返回缓存。
     """
+    cache_key = str(base_dir.resolve())
+    cached = _def_tables_cache.get(cache_key)
+    if cached is not None:
+        if verbose:
+            print(f"  (复用进程缓存: {len(cached.reco_param)} reco / {len(cached.action_param)} action)")
+        return cached
+
     reco_param: Dict[str, dict] = {}
     action_param: Dict[str, dict] = {}
     wait_freezes: dict = {}
@@ -269,13 +288,15 @@ def build_def_tables(base_dir: pathlib.Path, verbose: bool = False) -> DefTables
     if verbose:
         print()
 
-    return DefTables(
+    result = DefTables(
         reco_param=reco_param,
         action_param=action_param,
         wait_freezes=wait_freezes,
         task_top=task_top,
         failed_types=failed,
     )
+    _def_tables_cache[cache_key] = result
+    return result
 
 
 # ============================================================

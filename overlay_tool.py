@@ -34,7 +34,7 @@ from core import diff
 from core import inplace
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
@@ -118,6 +118,13 @@ class OverlayToolApp:
             if cfg.maa_pkg_dir:
                 status.append("\nmaa    : ", style="dim")
                 status.append(str(cfg.maa_pkg_dir) + " (显式)", style="cyan")
+            status.append("\n输出   : ", style="dim")
+            if cfg.output_format == "v1":
+                status.append("V1", style="bold magenta")
+                status.append("  (拍平 / 省略默认)", style="dim magenta")
+            else:
+                status.append("V2", style="bold cyan")
+                status.append("  (嵌套 / 全字段)", style="dim cyan")
 
         content = Text()
         content.append_text(title)
@@ -135,6 +142,7 @@ class OverlayToolApp:
         items = []
         if not mounted:
             items.append(("M", "挂载", "备份 mod, base+mod 合并写入工作区"))
+            items.append(("V", "切换输出格式", "V2 ↔ V1 (仅未挂载时可切)"))
         else:
             items.append(("U", "卸载", "diff 提取 minimal mod, 写回 mod 包"))
         items += [
@@ -154,11 +162,18 @@ class OverlayToolApp:
     def action_mount(self):
         assert self.config is not None
         self.console.print("\n[bold]━━━ 挂载 ━━━[/bold]\n")
+        fmt = self.config.output_format
+        fmt_label = (
+            "[magenta]V1[/magenta] (拍平 / 省略默认)"
+            if fmt == "v1"
+            else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+        )
         self.console.print(
             "[yellow]注意[/yellow] 挂载将备份当前 mod 包, 然后用 base+mod 合并的 canonical "
             "全字段内容覆盖。\n"
             "  若 mod 在 Git 仓库中, git status 会出现大量变更, 属正常现象。\n"
             "  建议挂载前先 commit 当前状态。\n"
+            f"  当前输出格式: {fmt_label}\n"
         )
         if not Confirm.ask("确认继续挂载?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
@@ -189,6 +204,13 @@ class OverlayToolApp:
     def action_unmount(self):
         assert self.config is not None
         self.console.print("\n[bold]━━━ 卸载 ━━━[/bold]\n")
+        fmt = self.config.output_format
+        fmt_label = (
+            "[magenta]V1[/magenta] (拍平 / 省略默认)"
+            if fmt == "v1"
+            else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+        )
+        self.console.print(f"  当前输出格式: {fmt_label}\n")
         if not Confirm.ask("确认继续卸载?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
             return
@@ -262,6 +284,45 @@ class OverlayToolApp:
         self.console.print()
         self.console.print(Panel(HELP_TEXT, title="使用说明", border_style="cyan", expand=False))
 
+    def action_toggle_format(self):
+        """切换 V2 ↔ V1 输出格式 (仅未挂载时可切)。"""
+        assert self.config is not None
+        self.console.print("\n[bold]━━━ 切换输出格式 ━━━[/bold]\n")
+        cur = self.config.output_format
+        new = "v1" if cur == "v2" else "v2"
+
+        cur_label = "[cyan]V2[/cyan] (嵌套 / 全字段)" if cur == "v2" else "[magenta]V1[/magenta] (拍平 / 省略默认)"
+        new_label = "[magenta]V1[/magenta] (拍平 / 省略默认)" if new == "v1" else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+
+        self.console.print(f"  当前: {cur_label}")
+        self.console.print(f"  目标: {new_label}\n")
+
+        if new == "v1":
+            self.console.print(
+                "[yellow]提示[/yellow] V1 模式将影响下次挂载和卸载的产物形态:\n"
+                "  • 工作区文件: recognition/action 字段拍平到 task 顶层\n"
+                "  • mod 产物:   同样拍平形态\n"
+                "  • 默认 type (DirectHit/DoNothing) 整段省略\n"
+                "  此切换不会修改当前已挂载的工作区 — 下次挂载才生效。\n"
+            )
+
+        if not Confirm.ask(f"确认切换为 {new.upper()}?", default=True):
+            self.console.print("[yellow]操作取消[/yellow]")
+            return
+
+        try:
+            config_mod.set_output_format_in_config(self.config_path, new)
+        except Exception as e:
+            self.console.print(f"[red]✗ 写入配置失败: {e}[/red]")
+            return
+
+        # 重新加载 config 让本次会话生效
+        self.config = config_mod.load_config(self.config_path)
+        self.console.print(
+            f"[green]✓ 已切换为 {new.upper()}[/green]  "
+            f"[dim](写入 {self.config_path.name}, 下次挂载/卸载生效)[/dim]"
+        )
+
     def run(self):
         self.console.clear()
         self.console.print(f"[dim]配置文件: {self.config_path}[/dim]\n")
@@ -296,13 +357,18 @@ class OverlayToolApp:
             self._render_menu()
 
             mounted = self.state == STATE_MOUNTED
-            choices = ["U" if mounted else "M", "L", "B", "H", "0"]
+            if mounted:
+                choices = ["U", "L", "B", "H", "0"]
+            else:
+                choices = ["M", "V", "L", "B", "H", "0"]
             choice = Prompt.ask("选择操作", choices=choices, default="0").upper()
 
             if choice == "M":
                 self.action_mount()
             elif choice == "U":
                 self.action_unmount()
+            elif choice == "V":
+                self.action_toggle_format()
             elif choice == "L":
                 self.action_view_log()
             elif choice == "B":

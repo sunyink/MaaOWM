@@ -40,6 +40,7 @@ from . import diff
 from . import oracle
 from . import routing
 from . import snapshot
+from . import translator
 
 ProgressCb = Optional[Callable[[str], None]]
 
@@ -363,9 +364,15 @@ def mount(
     cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
     cb(f"  清理: {cleaned} 旧文件")
 
-    grouped = routing.group_by_target_file(canonical_merged, index)
+    # V1/V2 输出选择
+    pipeline_to_write = canonical_merged
+    if cfg.output_format == "v1":
+        cb("  转 V1 格式 (按 MPE 风格拍平)...")
+        pipeline_to_write = translator.pipeline_v2_to_v1(canonical_merged)
+
+    grouped = routing.group_by_target_file(pipeline_to_write, index)
     written = routing.write_mod_files(grouped, cfg.workspace_pipeline_dir())
-    cb(f"  写入: {len(written)} 文件")
+    cb(f"  写入: {len(written)} 文件 [{cfg.output_format.upper()}]")
 
     # 写 README
     readme = cfg.workspace_dir / "__OWM_README__.md"
@@ -474,9 +481,15 @@ def unmount(
     cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
     cb(f"  清理: {cleaned} 文件")
 
-    grouped = routing.group_by_target_file(diff_result.minimal_mod, index)
+    # V1/V2 输出选择
+    minimal_to_write = diff_result.minimal_mod
+    if cfg.output_format == "v1":
+        cb("  转 V1 格式 (按 MPE 风格拍平)...")
+        minimal_to_write = translator.pipeline_v2_to_v1(diff_result.minimal_mod)
+
+    grouped = routing.group_by_target_file(minimal_to_write, index)
     written = routing.write_mod_files(grouped, cfg.workspace_pipeline_dir())
-    cb(f"  写入: {len(written)} mod 文件")
+    cb(f"  写入: {len(written)} mod 文件 [{cfg.output_format.upper()}]")
 
     # 删除 README
     readme = cfg.workspace_dir / "__OWM_README__.md"

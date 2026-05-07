@@ -28,6 +28,7 @@ class OverlayConfig:
     target_path: pathlib.Path                    # mod 包目录 (绝对)
     base_layer_paths_resolved: List[pathlib.Path]  # base 目录列表 (绝对)
     maa_pkg_dir: Optional[pathlib.Path]          # 显式 maa 包目录 (绝对)
+    output_format: str = "v2"                    # "v2" (默认) 或 "v1"
 
     def base_layer_paths(self) -> List[pathlib.Path]:
         return self.base_layer_paths_resolved
@@ -119,12 +120,41 @@ def load_config(config_path: pathlib.Path) -> OverlayConfig:
             raise ConfigError("maa_pkg_dir 必须是字符串")
         maa_pkg_dir = _resolve_path(raw["maa_pkg_dir"], config_root)
 
+    output_format = "v2"
+    if "output_format" in raw:
+        of = raw["output_format"]
+        if of not in ("v1", "v2"):
+            raise ConfigError(
+                f"output_format 必须是 'v1' 或 'v2', 实际: {of!r}"
+            )
+        output_format = of
+
     return OverlayConfig(
         config_path=config_path,
         config_root=config_root,
         target_path=target_path,
         base_layer_paths_resolved=base_layer_paths,
         maa_pkg_dir=maa_pkg_dir,
+        output_format=output_format,
+    )
+
+
+def set_output_format_in_config(
+    config_path: pathlib.Path,
+    new_format: str,
+) -> None:
+    """原地修改配置文件的 output_format 字段, 保留其他内容。
+
+    用于 TUI 切换格式时持久化到 overlay_config.json。
+    """
+    if new_format not in ("v1", "v2"):
+        raise ConfigError(f"new_format 必须是 'v1' 或 'v2', 实际: {new_format!r}")
+    text = config_path.read_text(encoding="utf-8-sig")
+    raw = json.loads(text)
+    raw["output_format"] = new_format
+    config_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -132,6 +162,7 @@ SAMPLE_CONFIG = {
     "target": "assets/resource/PC",
     "base_layers": ["assets/resource/base"],
     "maa_pkg_dir": None,
+    "output_format": "v2",
 }
 
 
