@@ -107,9 +107,9 @@ def write_mod_files(
         target = mod_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        # 稳定的 key 顺序, 让 git diff 友好
-        ordered = {k: tasks[k] for k in sorted(tasks)}
-        text = json.dumps(ordered, ensure_ascii=False, indent=4) + "\n"
+        # 信任调用方传入的 task 顺序 — 上游应已通过 extras.reorder_pipeline_by_node_order
+        # 按 base 原序重排 (V0.7.0+). dict 保序 (Python 3.7+).
+        text = json.dumps(tasks, ensure_ascii=False, indent=4) + "\n"
 
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")

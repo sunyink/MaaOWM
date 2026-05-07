@@ -347,6 +347,43 @@ def _resolve_type(
     return None
 
 
+def _strip_sub_recognition(sub_node: Any, def_tables: "DefTables") -> int:
+    """剥离 And/Or 内的 sub-recognition (在 all_of/any_of 数组里).
+
+    输入可能是:
+      - string (引用其他 task 名) → 不动, 返回 0
+      - dict (内联 sub):
+          {"sub_name": "OCR", "recognition": {"type":"OCR", "param":{...}}}
+        剥离规则:
+          1. 按 recognition.type 剥 recognition.param 内 def 字段
+          2. recognition.param 全空 → 删 param
+          3. sub_name == recognition.type → 删 sub_name (parser 会自动回填)
+    返回删除字段数。
+    """
+    if not isinstance(sub_node, dict):
+        return 0
+    removed = 0
+
+    reco = sub_node.get("recognition")
+    if isinstance(reco, dict):
+        r_type = reco.get("type")
+        if r_type and r_type in def_tables.reco_param:
+            param = reco.get("param")
+            if isinstance(param, dict):
+                removed += _strip_dict_by_def(param, def_tables.reco_param[r_type])
+                if not param:
+                    del reco["param"]
+                    removed += 1
+
+        # sub_name == reco.type 时, parser 会自动用 type 名作为 sub_name
+        # (parse_sub_recognition 第 1980-1982 行)
+        if r_type and sub_node.get("sub_name") == r_type:
+            del sub_node["sub_name"]
+            removed += 1
+
+    return removed
+
+
 def strip_mod_with_def(
     mod: Dict[str, dict],
     def_tables: DefTables,
@@ -356,13 +393,29 @@ def strip_mod_with_def(
 
     canonical_w: worktime 的 canonical, 用于查 task 当前 type
                  (mod 自己若没写 type 字段, 我们仍要知道用哪个 def 表)
+
+    剥离规则 (V0.6.1, verify_workspace_minimal_v2 验证 round-trip 闭合):
+      1. recognition.param 内字段按 type 剥
+      2. action.param 内字段按 type 剥
+      3. wait_freezes 内字段按其 def 剥 (单一类型)
+      4. attach/anchor 嵌套 dict 内字段按 task_top def 剥
+      5. task 顶层标量/列表字段按 task_top def 剥 (★ V0.6.1 加)
+      6. And 的 box_index == 0 删 (★ V0.6.1 加)
+      7. And/Or 的 sub-recognition 数组递归剥 (★ V0.6.1 加)
     """
     total = 0
+    # 顶层"非 def 字段域"白名单 — 这些字段由专用逻辑处理, 不参与通用顶层剥离
+    SPECIAL_TOP_KEYS = {
+        "recognition", "action",
+        "pre_wait_freezes", "post_wait_freezes", "repeat_wait_freezes",
+        "attach", "anchor",
+    }
+
     for task_name, task_def in mod.items():
         if not isinstance(task_def, dict):
             continue
 
-        # ── recognition.param ──
+        # ── 1. recognition.param ──
         reco = task_def.get("recognition")
         if isinstance(reco, dict):
             r_type = _resolve_type(reco, canonical_w, task_name, "recognition")
@@ -373,13 +426,29 @@ def strip_mod_with_def(
                     if not param:
                         del reco["param"]
                         total += 1
-                # 若 recognition 剥得只剩 {} 整段删 (路 D 后剥离的副产物)
                 if not reco:
                     del task_def["recognition"]
                     total += 1
-            # type 不在白名单 → recognition 整段保留, 不动
+                    reco = None  # 后续 6/7 规则的引用一致
 
-        # ── action.param ──
+            # ── 6. And box_index == 0 删 ──
+            if r_type == "And" and isinstance(reco, dict):
+                param = reco.get("param", {})
+                if isinstance(param, dict) and param.get("box_index") == 0:
+                    del param["box_index"]
+                    total += 1
+
+            # ── 7. And/Or 子嵌套递归剥 ──
+            if r_type in ("And", "Or") and isinstance(reco, dict):
+                param = reco.get("param", {})
+                if isinstance(param, dict):
+                    arr_key = "all_of" if r_type == "And" else "any_of"
+                    arr = param.get(arr_key)
+                    if isinstance(arr, list):
+                        for sub in arr:
+                            total += _strip_sub_recognition(sub, def_tables)
+
+        # ── 2. action.param ──
         act = task_def.get("action")
         if isinstance(act, dict):
             a_type = _resolve_type(act, canonical_w, task_name, "action")
@@ -394,7 +463,7 @@ def strip_mod_with_def(
                     del task_def["action"]
                     total += 1
 
-        # ── wait_freezes (单一 type) ──
+        # ── 3. wait_freezes (单一 type) ──
         for key in ("pre_wait_freezes", "post_wait_freezes", "repeat_wait_freezes"):
             wf = task_def.get(key)
             if isinstance(wf, dict) and def_tables.wait_freezes:
@@ -403,7 +472,7 @@ def strip_mod_with_def(
                     del task_def[key]
                     total += 1
 
-        # ── task 顶层嵌套 (attach/anchor) ──
+        # ── 4. task 顶层嵌套 (attach/anchor) ──
         for key in ("attach", "anchor"):
             d = task_def.get(key)
             d_def = def_tables.task_top.get(key) if def_tables.task_top else None
@@ -412,6 +481,20 @@ def strip_mod_with_def(
                 if not d:
                     del task_def[key]
                     total += 1
+
+        # ── 5. ★ task 顶层标量/列表字段按 task_top def 剥 ──
+        # 例如: enabled:true, inverse:false, max_hit:4294967295, on_error:[],
+        #       post_delay:200, pre_delay:200, rate_limit:1000, repeat:1,
+        #       repeat_delay:0, timeout:20000, focus:None
+        # 排除 SPECIAL_TOP_KEYS (它们由 1-4 规则单独处理)
+        for key in list(task_def.keys()):
+            if key in SPECIAL_TOP_KEYS:
+                continue
+            if key not in def_tables.task_top:
+                continue   # 不在 def 表里, 是 extras 或非 def 字段, 保留
+            if task_def[key] == def_tables.task_top[key]:
+                del task_def[key]
+                total += 1
 
     return total
 
@@ -477,11 +560,17 @@ def _self_test() -> bool:
             "attach": {},
             "anchor": {},
             "enabled": True,
+            "inverse": False,
             "max_hit": 4294967295,
+            "on_error": [],
             "post_delay": 200,
             "pre_delay": 200,
             "rate_limit": 1000,
+            "repeat": 1,
+            "repeat_delay": 0,
             "timeout": 20000,
+            "focus": None,
+            "next": [],
         },
         failed_types=["recognition:NeuralNetworkClassifier"],
     )
@@ -660,6 +749,192 @@ def _self_test() -> bool:
             }
         },
         {"TaskH": {}},
+    ))
+
+    # case 9: ★ V0.6.1 顶层标量字段按 task_top def 剥
+    cases.append((
+        "顶层标量字段 def 剥 (V0.6.1)",
+        {
+            "TaskI": {
+                "enabled": True,           # def → 删
+                "inverse": False,          # def → 删
+                "max_hit": 4294967295,     # def → 删
+                "post_delay": 200,         # def → 删
+                "pre_delay": 1000,         # 用户值, 保留
+                "rate_limit": 1000,        # def → 删
+                "repeat": 1,               # def → 删
+                "timeout": 30000,          # 用户值, 保留
+                "next": ["X"],             # 用户值, 保留 (next 是列表, 通常不进 def)
+            }
+        },
+        {
+            "TaskI": {
+                "pre_delay": 1000,
+                "timeout": 30000,
+                "next": ["X"],
+            }
+        },
+    ))
+
+    # case 10: ★ V0.6.1 And box_index == 0 删 + 子嵌套递归剥
+    cases.append((
+        "And.box_index 默认 0 删 + 子嵌套剥离",
+        {
+            "TaskJ": {
+                "recognition": {
+                    "type": "And",
+                    "param": {
+                        "box_index": 0,
+                        "all_of": [
+                            {
+                                "sub_name": "OCR",          # == reco.type → 删
+                                "recognition": {
+                                    "type": "OCR",
+                                    "param": {
+                                        "expected": ["确定"],
+                                        "threshold": 0.3,    # def → 删
+                                        "roi": [0, 0, 0, 0], # def → 删
+                                    },
+                                },
+                            },
+                            "Global_External",   # 字符串引用, 不动
+                            {
+                                "sub_name": "我的注释别名",   # != type, 保留
+                                "recognition": {
+                                    "type": "ColorMatch",
+                                    "param": {
+                                        "lower": [[10, 20, 30]],
+                                        "upper": [[200, 200, 200]],
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+        {
+            "TaskJ": {
+                "recognition": {
+                    "type": "And",
+                    "param": {
+                        "all_of": [
+                            {
+                                "recognition": {
+                                    "type": "OCR",
+                                    "param": {"expected": ["确定"]},
+                                },
+                            },
+                            "Global_External",
+                            {
+                                "sub_name": "我的注释别名",
+                                "recognition": {
+                                    "type": "ColorMatch",
+                                    "param": {
+                                        "lower": [[10, 20, 30]],
+                                        "upper": [[200, 200, 200]],
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+    ))
+
+    # case 11: ★ V0.6.1 Or 子嵌套剥离 (任一)
+    cases.append((
+        "Or.any_of 子嵌套剥离",
+        {
+            "TaskK": {
+                "recognition": {
+                    "type": "Or",
+                    "param": {
+                        "any_of": [
+                            {
+                                "sub_name": "OCR",
+                                "recognition": {
+                                    "type": "OCR",
+                                    "param": {
+                                        "expected": ["X"],
+                                        "threshold": 0.3,    # def
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+        {
+            "TaskK": {
+                "recognition": {
+                    "type": "Or",
+                    "param": {
+                        "any_of": [
+                            {
+                                "recognition": {
+                                    "type": "OCR",
+                                    "param": {"expected": ["X"]},
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+    ))
+
+    # case 12: ★ V0.6.1 黑名单 type 在子嵌套也不剥
+    cases.append((
+        "And 子嵌套含黑名单 type → 不剥",
+        {
+            "TaskL": {
+                "recognition": {
+                    "type": "And",
+                    "param": {
+                        "all_of": [
+                            {
+                                "sub_name": "NeuralNetworkClassifier",
+                                "recognition": {
+                                    "type": "NeuralNetworkClassifier",
+                                    "param": {
+                                        "labels": ["a", "b"],
+                                        "model": "x.onnx",
+                                        "roi": [0, 0, 0, 0],
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+        # 期望: 整段保留 (NN 不在白名单, sub_name 也保留, 因为 sub_name == type 但 type 不在白名单 — 谨慎不动)
+        # 实际行为: sub_name == reco.type 仍然会触发删除 (无关白名单 — parser 总会回填)
+        # 所以 sub_name 会被删, 但 param 不动
+        {
+            "TaskL": {
+                "recognition": {
+                    "type": "And",
+                    "param": {
+                        "all_of": [
+                            {
+                                "recognition": {
+                                    "type": "NeuralNetworkClassifier",
+                                    "param": {
+                                        "labels": ["a", "b"],
+                                        "model": "x.onnx",
+                                        "roi": [0, 0, 0, 0],
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            }
+        },
     ))
 
     import copy

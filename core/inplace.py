@@ -37,7 +37,9 @@ from typing import Callable, Dict, List, Optional
 from . import config as config_mod
 from . import def_table
 from . import diff
+from . import extras as extras_mod
 from . import oracle
+from . import preflight
 from . import routing
 from . import snapshot
 from . import translator
@@ -46,27 +48,53 @@ ProgressCb = Optional[Callable[[str], None]]
 
 
 DEF_TABLES_FILENAME = "def_tables.json"
+EXTRAS_FILENAME = "extras.json"
 
 
 OWM_README_TEXT = """\
 # MaaOWM 工作区
 
-此目录由 MaaOWM 挂载生成。每个 task 都已展开为 canonical 全字段 (V2) 形态。
+此目录由 MaaOWM 挂载生成。每个 task 已展开为 base+mod 合并后的 canonical
+形态, 并按"省略默认值"原则做了精简:
+  - 字段值等于框架默认值的, 不写出 (省屏占, 接近 base 简洁形态)
+  - next/on_error 用紧凑字符串写法 (默认; 可在配置切换)
+  - 输出格式默认 V2 (嵌套); 可切换 V1 (拍平), 看个人偏好
+  - 保留 base/mod 中的注释字段 (doc, desc 等非 MaaFW 字段, V0.7.0+)
+  - 节点顺序参考 base 原始顺序 (新建 task 排在文件末尾)
 
 ## 编辑准则
 
   ✓ 修改字段值              (post_delay: 3000 → 200)
   ✓ 给 task 添加新字段
   ✓ 新建 task
+  ✓ 修改/新增 doc/desc 等注释字段 (会被持久化到 mod)
 
-  ✗ 不要从 task 里删除字段
-     原因: 工作区独立加载时, 缺失字段会退到框架默认。
-           你的"删除"实际效果可能是"改成默认值", 与你的预期不符。
+  ✗ 不要从 task 里删除字段, 妄图"恢复"成 base 的值
+     原因: 工作区独立加载时, 缺失字段会退到框架默认值 (不是 base 的值)。
+           你的"删除"实际效果是"改成框架默认", 与你的预期不符。
      做法: 如需还原 base 的某字段, 请直接把值改成你期望的形态。
+     旁注: 你看到的工作区里没写的字段, 也不代表是 base 的值, 可能是
+          框架默认 — 加载时 parser 会自动还原。
 
   ✗ 不要随意删除被引用的 task
      原因: next/on_error 引用不存在的 task 名时, MaaFW 会拒绝加载。
      做法: 如需让 task 失效, 在原位加 "enabled": false 而非删除。
+
+## doc/desc 等注释字段
+
+  这些字段不参与 MaaFW 运行, 但保留在工作区方便阅读和编辑.
+  
+  • 修改 doc 内容       → 卸载时持久化到 mod
+  • 删除整行 doc 字段   → mod 也不写, 重新挂载时从 base 恢复 (相当于撤回修改)
+  • 想真正"清空"注释   → 显式写 doc: ""
+
+## 卸载时的安全检查
+
+  按 [U] 卸载前, OWM 会自动跑一次预检 (oracle.canonicalize 模拟加载)。
+  如果工作区有语法错误或字段类型错误 (例: TM 改 OCR 没改 threshold 写法),
+  会阻断卸载并提示, 你可用 VSC + MAA support 插件查具体错误位置。
+
+  随时可按 [C] 主动检查工作区状态, 看变动总览和文件分布。
 
 ## 文件归属
 
@@ -76,7 +104,7 @@ OWM_README_TEXT = """\
 ## 备份
 
   挂载/卸载前的状态都备份在 .maaowm/ 下, 时间戳目录形式。
-  误操作可从备份恢复。
+  误操作可从备份恢复 (按 [B] 查看)。
 """
 
 
@@ -321,15 +349,33 @@ def mount(
         def_tables.to_json(), encoding="utf-8"
     )
 
-    # canonicalize base + mod (要的是合并后的工作区内容)
-    # 边界: mod 目录可能为空 (首次挂载常见). MaaFW 的 post_pipeline
-    # 对空目录会报 load_all_json failed, 此时直接复用 canonical_base 即可。
+    # 检测 mod 是否含 JSON (extras 扫描和后面 canonicalize 都用)
     mod_dir = cfg.workspace_pipeline_dir()
     mod_has_json = any(
         p.is_file() and p.suffix.lower() in (".json", ".jsonc")
         and not any(part.startswith(".") for part in p.relative_to(mod_dir).parts)
         for p in mod_dir.rglob("*")
     )
+
+    # 扫 extras + 节点顺序 (V0.7.0): 必须在 mod 清空前完成
+    # base 各层 + mod 覆盖式合并, 取得最终 extras 与 node_order
+    cb("扫描 extras + 节点顺序 (base+mod 原始 JSON)...")
+    extras_snap = extras_mod.collect_layered_extras(
+        layers=cfg.base_pipeline_dirs(),
+        mod_dir=mod_dir if mod_has_json else None,
+        def_tables=def_tables,
+    )
+    cb(
+        f"  extras: {len(extras_snap.extras)} task / "
+        f"node_order: {len(extras_snap.node_order)} 文件"
+    )
+    (cfg.owm_dir / EXTRAS_FILENAME).write_text(
+        extras_snap.to_json(), encoding="utf-8"
+    )
+
+    # canonicalize base + mod (要的是合并后的工作区内容)
+    # 边界: mod 目录可能为空 (首次挂载常见). MaaFW 的 post_pipeline
+    # 对空目录会报 load_all_json failed, 此时直接复用 canonical_base 即可。
 
     if not mod_has_json:
         cb("mod 目录为空, 跳过 mod 加载, 工作区 = base canonical")
@@ -364,15 +410,49 @@ def mount(
     cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
     cb(f"  清理: {cleaned} 旧文件")
 
-    # V1/V2 输出选择
+    # 流水线: canonical → def 剥离 → V1 转译 → next 紧凑 → 写文件
+    # 顺序约束:
+    #   - def 剥离必须在 V1 转译之前 (strip 按 V2 type 查表)
+    #   - next 紧凑独立, 放最后或最前都行 (放最后省一次遍历)
     pipeline_to_write = canonical_merged
+
+    # def 剥离 (V0.6.0): 让工作区接近 base 简洁形态
+    # round-trip 已实证闭合 (verify_workspace_minimal.py 通过)
+    cb("  def 剥离 (按 type 白名单, 减少冗余字段)...")
+    stripped = def_table.strip_mod_with_def(
+        pipeline_to_write, def_tables, canonical_w=canonical_merged,
+    )
+    cb(f"  剥离 {stripped} 个 def 字段")
+
+    # V1/V2 输出选择
     if cfg.output_format == "v1":
         cb("  转 V1 格式 (按 MPE 风格拍平)...")
-        pipeline_to_write = translator.pipeline_v2_to_v1(canonical_merged)
+        pipeline_to_write = translator.pipeline_v2_to_v1(pipeline_to_write)
+
+    # next/on_error 紧凑写法 (默认开启, 与 V1/V2 正交)
+    if cfg.compact_node_refs:
+        cb("  next/on_error 紧凑写法...")
+        translator.simplify_node_refs_in_pipeline(pipeline_to_write)
+
+    # extras 注入 (V0.7.0): 把 doc/desc 等非 MaaFW 字段塞回每个 task
+    cb("  注入 extras (doc/desc 等非 MaaFW 字段)...")
+    injected = extras_mod.inject_extras_into_pipeline(pipeline_to_write, extras_snap)
+    cb(f"  注入 {injected} 个 extras 字段")
 
     grouped = routing.group_by_target_file(pipeline_to_write, index)
-    written = routing.write_mod_files(grouped, cfg.workspace_pipeline_dir())
-    cb(f"  写入: {len(written)} 文件 [{cfg.output_format.upper()}]")
+
+    # 节点顺序重排 (V0.7.0): 每个文件按 base 中记录的顺序重排 task
+    cb("  按 node_order 重排各文件...")
+    grouped_reordered = {
+        rel: extras_mod.reorder_pipeline_by_node_order(p, rel, extras_snap.node_order)
+        for rel, p in grouped.items()
+    }
+
+    written = routing.write_mod_files(grouped_reordered, cfg.workspace_pipeline_dir())
+    fmt_label = cfg.output_format.upper()
+    if cfg.compact_node_refs:
+        fmt_label += " + 紧凑 next"
+    cb(f"  写入: {len(written)} 文件 [{fmt_label}]")
 
     # 写 README
     readme = cfg.workspace_dir / "__OWM_README__.md"
@@ -411,11 +491,47 @@ def unmount(
     except oracle.OracleError as e:
         raise UnmountError(str(e)) from None
 
+    # 预检 (失败阻断, 不动用户工作区, 不写备份)
+    cb("预检工作区...")
+    pre_result = preflight.validate_workspace(
+        cfg, progress_callback=lambda m: cb(f"  {m}"),
+    )
+    if not pre_result.ok:
+        raise UnmountError(
+            f"{pre_result.summary}\n\n{pre_result.error_detail}"
+        )
+    cb(f"  ✓ 预检通过: {pre_result.summary}")
+
     # 备份当前工作区
     cb("备份当前工作区 (work)...")
     work_backup = _backup_dir(cfg, "work")
     work_count = _copy_pipeline_only(cfg.workspace_pipeline_dir(), work_backup / cfg.pipeline_subdir)
     cb(f"  备份: {work_backup.name} ({work_count} 文件)")
+
+    # 读 def 表 (挂载时存的, 用于扫描 extras 字段判定)
+    def_path = cfg.owm_dir / DEF_TABLES_FILENAME
+    def_tables_for_extras = None
+    if def_path.exists():
+        try:
+            def_tables_for_extras = def_table.DefTables.from_json(
+                def_path.read_text(encoding="utf-8")
+            )
+        except Exception as e:
+            warnings.append(f"读取挂载时 def 表失败 (extras 扫描跳过): {e}")
+
+    # 扫工作区原始 JSON, 抓最新 extras (用户可能改了 doc/desc) (V0.7.0)
+    workspace_extras: Optional[extras_mod.ExtrasSnapshot] = None
+    workspace_node_order: Dict[str, List[str]] = {}
+    if def_tables_for_extras is not None:
+        cb("扫描工作区 extras (用户编辑后的最新状态)...")
+        ws_extras_dict, ws_node_order = extras_mod.collect_extras_from_dir(
+            cfg.workspace_pipeline_dir(), def_tables_for_extras,
+        )
+        workspace_extras = extras_mod.ExtrasSnapshot(
+            extras=ws_extras_dict, node_order=ws_node_order,
+        )
+        workspace_node_order = ws_node_order
+        cb(f"  extras: {len(ws_extras_dict)} task / 文件: {len(ws_node_order)}")
 
     # canonicalize 工作区
     cb("canonicalize 工作区...")
@@ -443,6 +559,29 @@ def unmount(
     hints = diff.detect_hints(diff_result)
     if hints:
         cb(f"  hints: {len(hints)} 条")
+
+    # extras 变更检测 (V0.7.2): 用户单独改 doc/desc 也要写入 mod
+    # 即使 oracle diff 看 IDENTICAL, 只要 extras 变了就强制入 mod
+    extras_path = cfg.owm_dir / EXTRAS_FILENAME
+    if extras_path.exists() and workspace_extras is not None:
+        try:
+            mount_extras = extras_mod.ExtrasSnapshot.from_json(
+                extras_path.read_text(encoding="utf-8")
+            )
+            extras_changed = extras_mod.diff_extras(workspace_extras, mount_extras)
+            # 把 extras 变更但不在 minimal_mod 的 task 强制加进去
+            forced = 0
+            for name in extras_changed:
+                if name not in diff_result.minimal_mod:
+                    diff_result.minimal_mod[name] = {}
+                    forced += 1
+            if extras_changed:
+                cb(
+                    f"  extras 变更: {len(extras_changed)} task "
+                    f"({forced} 个强制入 mod)"
+                )
+        except Exception as e:
+            warnings.append(f"extras 变更检测失败: {e}")
 
     # 读 def 表 (挂载时存的) 并应用 def 剥离
     def_path = cfg.owm_dir / DEF_TABLES_FILENAME
@@ -487,9 +626,43 @@ def unmount(
         cb("  转 V1 格式 (按 MPE 风格拍平)...")
         minimal_to_write = translator.pipeline_v2_to_v1(diff_result.minimal_mod)
 
+    # next/on_error 紧凑写法
+    if cfg.compact_node_refs:
+        cb("  next/on_error 紧凑写法...")
+        translator.simplify_node_refs_in_pipeline(minimal_to_write)
+
+    # 注入 workspace extras 到 minimal_mod (V0.7.0)
+    # 仅对 minimal_mod 中存在的 task 注入 (即用户改过的 task)
+    # IDENTICAL task 不写 mod, 自然也不写 extras (mod 保持简洁)
+    if workspace_extras is not None:
+        cb("  注入 workspace extras (用户改过的 task 的 doc/desc)...")
+        # 过滤: 只注入 minimal_mod 中存在的 task 的 extras
+        filtered_snap = extras_mod.ExtrasSnapshot(
+            extras={
+                k: v for k, v in workspace_extras.extras.items()
+                if k in minimal_to_write
+            },
+            node_order=workspace_extras.node_order,
+        )
+        injected = extras_mod.inject_extras_into_pipeline(minimal_to_write, filtered_snap)
+        cb(f"  注入 {injected} 个 extras 字段")
+
     grouped = routing.group_by_target_file(minimal_to_write, index)
+
+    # 节点顺序重排 (V0.7.0): 用 workspace 的 node_order
+    # mod 中 task 的顺序参照工作区, 避免 hash 序意外暴露
+    if workspace_node_order:
+        cb("  按 workspace node_order 重排 mod 文件...")
+        grouped = {
+            rel: extras_mod.reorder_pipeline_by_node_order(p, rel, workspace_node_order)
+            for rel, p in grouped.items()
+        }
+
     written = routing.write_mod_files(grouped, cfg.workspace_pipeline_dir())
-    cb(f"  写入: {len(written)} mod 文件 [{cfg.output_format.upper()}]")
+    fmt_label = cfg.output_format.upper()
+    if cfg.compact_node_refs:
+        fmt_label += " + 紧凑 next"
+    cb(f"  写入: {len(written)} mod 文件 [{fmt_label}]")
 
     # 删除 README
     readme = cfg.workspace_dir / "__OWM_README__.md"
@@ -500,6 +673,7 @@ def unmount(
     (cfg.owm_dir / snapshot.SNAPSHOT_FILENAME).unlink(missing_ok=True)
     origin_path.unlink(missing_ok=True)
     (cfg.owm_dir / DEF_TABLES_FILENAME).unlink(missing_ok=True)
+    (cfg.owm_dir / EXTRAS_FILENAME).unlink(missing_ok=True)
 
     _log(cfg, f"[UNMOUNT-OK] mod_files={len(written)} counts={counts} backup={work_backup.name}")
 

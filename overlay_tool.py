@@ -32,9 +32,10 @@ except ImportError:
 from core import config as config_mod
 from core import diff
 from core import inplace
+from core import preflight
 
 
-VERSION = "0.4.0"
+VERSION = "0.7.2"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
@@ -124,7 +125,11 @@ class OverlayToolApp:
                 status.append("  (拍平 / 省略默认)", style="dim magenta")
             else:
                 status.append("V2", style="bold cyan")
-                status.append("  (嵌套 / 全字段)", style="dim cyan")
+                status.append("  (嵌套 / 默认值省略)", style="dim cyan")
+            # 紧凑节点引用 (默认开, 关闭时显示警示)
+            if not cfg.compact_node_refs:
+                status.append("  | next: ", style="dim")
+                status.append("object 形态", style="yellow")
 
         content = Text()
         content.append_text(title)
@@ -142,9 +147,11 @@ class OverlayToolApp:
         items = []
         if not mounted:
             items.append(("M", "挂载", "备份 mod, base+mod 合并写入工作区"))
-            items.append(("V", "切换输出格式", "V2 ↔ V1 (仅未挂载时可切)"))
         else:
             items.append(("U", "卸载", "diff 提取 minimal mod, 写回 mod 包"))
+            items.append(("C", "检查工作区", "预检语法 + 文件级变动统计 (dry-run)"))
+        items.append(("V", "切换输出格式", "V2 ↔ V1 (下次写文件时生效)"))
+        items.append(("N", "切换紧凑节点引用", "next/on_error: 字符串 ↔ object"))
         items += [
             ("L", "查看日志", "operations.log 最近记录"),
             ("B", "查看备份", ".maaowm/ 中的备份列表"),
@@ -166,14 +173,20 @@ class OverlayToolApp:
         fmt_label = (
             "[magenta]V1[/magenta] (拍平 / 省略默认)"
             if fmt == "v1"
-            else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+            else "[cyan]V2[/cyan] (嵌套 / 默认值省略)"
+        )
+        compact_label = (
+            "[green]紧凑写法[/green]"
+            if self.config.compact_node_refs
+            else "[yellow]object 形态[/yellow]"
         )
         self.console.print(
             "[yellow]注意[/yellow] 挂载将备份当前 mod 包, 然后用 base+mod 合并的 canonical "
-            "全字段内容覆盖。\n"
+            "(默认值省略后) 内容覆盖。\n"
             "  若 mod 在 Git 仓库中, git status 会出现大量变更, 属正常现象。\n"
             "  建议挂载前先 commit 当前状态。\n"
             f"  当前输出格式: {fmt_label}\n"
+            f"  next/on_error: {compact_label}\n"
         )
         if not Confirm.ask("确认继续挂载?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
@@ -208,9 +221,15 @@ class OverlayToolApp:
         fmt_label = (
             "[magenta]V1[/magenta] (拍平 / 省略默认)"
             if fmt == "v1"
-            else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+            else "[cyan]V2[/cyan] (嵌套 / 默认值省略)"
         )
-        self.console.print(f"  当前输出格式: {fmt_label}\n")
+        compact_label = (
+            "[green]紧凑写法[/green]"
+            if self.config.compact_node_refs
+            else "[yellow]object 形态[/yellow]"
+        )
+        self.console.print(f"  当前输出格式: {fmt_label}")
+        self.console.print(f"  next/on_error: {compact_label}\n")
         if not Confirm.ask("确认继续卸载?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
             return
@@ -280,6 +299,96 @@ class OverlayToolApp:
         self.console.print(tbl)
         self.console.print(f"\n  [dim]备份位置: {self.config.owm_dir}[/dim]")
 
+    def action_validate(self):
+        """检查工作区: 预检语法 + 文件级变动统计 (dry-run, 不动任何文件)。"""
+        assert self.config is not None
+        self.console.print("\n[bold]━━━ 检查工作区 ━━━[/bold]\n")
+        try:
+            inplace.oracle.init(self.config.maa_pkg_dir)
+        except inplace.oracle.OracleError as e:
+            self.console.print(f"[red]oracle 初始化失败: {e}[/red]")
+            return
+
+        result = preflight.validate_workspace(
+            self.config,
+            progress_callback=lambda m: self.console.print(f"  [dim]→ {m}[/dim]"),
+        )
+
+        # 失败路径
+        if not result.ok:
+            self.console.print(f"\n[red]✗ {result.summary}[/red]\n")
+            for line in (result.error_detail or "").splitlines():
+                self.console.print(f"  [red]{line}[/red]")
+            self.console.print(
+                "\n  [yellow]此状态下 [U] 卸载将拒绝执行, 直至错误修复。[/yellow]"
+            )
+            return
+
+        # 成功路径 — 总览 → 文件列表 → 总结
+        self.console.print()
+        self._render_validate_report(result)
+
+    def _render_validate_report(self, result):
+        """成功验证后渲染报告: 总览 → 文件列表 → 总结"""
+        # 总览
+        overview = Table(
+            title="变动总览", title_style="bold cyan",
+            box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 2),
+        )
+        overview.add_column("状态", style="bold", no_wrap=True)
+        overview.add_column("数量", justify="right", style="cyan")
+        overview.add_row("修改", str(result.total_modified))
+        overview.add_row("新增", str(result.total_added))
+        overview.add_row("删除", str(result.total_deleted))
+        overview.add_row("无变化", f"[dim]{result.total_identical}[/dim]")
+        self.console.print(overview)
+        self.console.print()
+
+        # 文件列表
+        if result.file_stats:
+            files_tbl = Table(
+                title="按文件分布", title_style="bold cyan",
+                box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 2),
+            )
+            files_tbl.add_column("文件", style="white", no_wrap=False)
+            files_tbl.add_column("修改", justify="right", no_wrap=True)
+            files_tbl.add_column("新增", justify="right", no_wrap=True)
+            files_tbl.add_column("删除", justify="right", no_wrap=True)
+            files_tbl.add_column("无变化", justify="right", style="dim", no_wrap=True)
+
+            def _cell(n: int, color: str) -> str:
+                if n == 0:
+                    return "[dim]·[/dim]"
+                return f"[{color}]{n}[/{color}]"
+
+            for fs in result.file_stats:
+                if fs.has_changes:
+                    name_style = "bright_white"
+                else:
+                    name_style = "dim"
+                files_tbl.add_row(
+                    f"[{name_style}]{fs.relative}[/{name_style}]",
+                    _cell(fs.modified, "yellow"),
+                    _cell(fs.added, "green"),
+                    _cell(fs.deleted, "red"),
+                    str(fs.identical) if fs.identical else "[dim]·[/dim]",
+                )
+            self.console.print(files_tbl)
+            self.console.print()
+
+        # 总结
+        if result.has_changes():
+            self.console.print(f"[green]✓ {result.summary}[/green]")
+            self.console.print(
+                "  [dim]→ 改动量已达预期可考虑执行 [U] 卸载, "
+                "并 git commit 留个版本.[/dim]"
+            )
+        else:
+            self.console.print(f"[yellow]· {result.summary}[/yellow]")
+            self.console.print(
+                "  [dim]→ 无可卸载内容, 卸载也不会产生 mod 文件.[/dim]"
+            )
+
     def action_help(self):
         self.console.print()
         self.console.print(Panel(HELP_TEXT, title="使用说明", border_style="cyan", expand=False))
@@ -291,20 +400,41 @@ class OverlayToolApp:
         cur = self.config.output_format
         new = "v1" if cur == "v2" else "v2"
 
-        cur_label = "[cyan]V2[/cyan] (嵌套 / 全字段)" if cur == "v2" else "[magenta]V1[/magenta] (拍平 / 省略默认)"
-        new_label = "[magenta]V1[/magenta] (拍平 / 省略默认)" if new == "v1" else "[cyan]V2[/cyan] (嵌套 / 全字段)"
+        cur_label = "[cyan]V2[/cyan] (嵌套 / 默认值省略)" if cur == "v2" else "[magenta]V1[/magenta] (拍平 / 省略默认)"
+        new_label = "[magenta]V1[/magenta] (拍平 / 省略默认)" if new == "v1" else "[cyan]V2[/cyan] (嵌套 / 默认值省略)"
 
         self.console.print(f"  当前: {cur_label}")
         self.console.print(f"  目标: {new_label}\n")
 
+        mounted = self.state == STATE_MOUNTED
+
         if new == "v1":
-            self.console.print(
-                "[yellow]提示[/yellow] V1 模式将影响下次挂载和卸载的产物形态:\n"
+            base_hint = (
+                "[yellow]提示[/yellow] V1 模式说明:\n"
                 "  • 工作区文件: recognition/action 字段拍平到 task 顶层\n"
                 "  • mod 产物:   同样拍平形态\n"
                 "  • 默认 type (DirectHit/DoNothing) 整段省略\n"
-                "  此切换不会修改当前已挂载的工作区 — 下次挂载才生效。\n"
             )
+        else:
+            base_hint = (
+                "[yellow]提示[/yellow] V2 模式说明:\n"
+                "  • 工作区文件: recognition/action 嵌套对象形态\n"
+                "  • mod 产物:   同样嵌套形态\n"
+            )
+
+        if mounted:
+            timing_hint = (
+                "  [bold]当前已挂载[/bold] — 工作区文件保持不变 (避免覆盖你的编辑).\n"
+                "  下次卸载时, mod 产物将以新格式写入.\n"
+                "  如想立即看到新格式工作区: 卸载 → 切换 → 重新挂载.\n"
+            )
+        else:
+            timing_hint = (
+                "  [bold]当前未挂载[/bold] — 不影响任何文件.\n"
+                "  下次挂载时, 工作区将以新格式写入.\n"
+            )
+
+        self.console.print(base_hint + timing_hint)
 
         if not Confirm.ask(f"确认切换为 {new.upper()}?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
@@ -320,7 +450,63 @@ class OverlayToolApp:
         self.config = config_mod.load_config(self.config_path)
         self.console.print(
             f"[green]✓ 已切换为 {new.upper()}[/green]  "
-            f"[dim](写入 {self.config_path.name}, 下次挂载/卸载生效)[/dim]"
+            f"[dim](写入 {self.config_path.name})[/dim]"
+        )
+
+    def action_toggle_compact(self):
+        """切换 next/on_error 紧凑写法。"""
+        assert self.config is not None
+        self.console.print("\n[bold]━━━ 切换紧凑节点引用 ━━━[/bold]\n")
+        cur = self.config.compact_node_refs
+        new = not cur
+
+        cur_label = "[green]启用[/green] (字符串 + [JumpBack] 前缀)" if cur else "[yellow]关闭[/yellow] (object 形态)"
+        new_label = "[green]启用[/green] (字符串 + [JumpBack] 前缀)" if new else "[yellow]关闭[/yellow] (object 形态)"
+
+        self.console.print(f"  当前: {cur_label}")
+        self.console.print(f"  目标: {new_label}\n")
+
+        if new:
+            self.console.print(
+                '[yellow]提示[/yellow] 紧凑写法示例:\n'
+                '  next: ["TaskA", "[JumpBack]TaskB", "[Anchor][JumpBack]TaskC"]\n'
+                "  适合手写, 与 base 习惯一致, 大多数项目首选.\n"
+            )
+        else:
+            self.console.print(
+                '[yellow]提示[/yellow] object 写法示例:\n'
+                '  next: [{"name":"TaskA", "anchor":false, "jump_back":false}, ...]\n'
+                "  字段显式, 适合脚本程序处理, 极少用户偏好.\n"
+            )
+
+        mounted = self.state == STATE_MOUNTED
+        if mounted:
+            self.console.print(
+                "  [bold]当前已挂载[/bold] — 工作区文件保持不变.\n"
+                "  下次卸载时 mod 产物将以新写法写入.\n"
+                "  如想立即看到新写法工作区: 卸载 → 切换 → 重新挂载.\n"
+            )
+        else:
+            self.console.print(
+                "  [bold]当前未挂载[/bold] — 下次挂载/卸载时生效.\n"
+            )
+
+        if not Confirm.ask(
+            f"确认{'启用' if new else '关闭'}紧凑节点引用?", default=True
+        ):
+            self.console.print("[yellow]操作取消[/yellow]")
+            return
+
+        try:
+            config_mod.set_compact_node_refs_in_config(self.config_path, new)
+        except Exception as e:
+            self.console.print(f"[red]✗ 写入配置失败: {e}[/red]")
+            return
+
+        self.config = config_mod.load_config(self.config_path)
+        self.console.print(
+            f"[green]✓ 紧凑节点引用已{'启用' if new else '关闭'}[/green]  "
+            f"[dim](写入 {self.config_path.name})[/dim]"
         )
 
     def run(self):
@@ -358,17 +544,21 @@ class OverlayToolApp:
 
             mounted = self.state == STATE_MOUNTED
             if mounted:
-                choices = ["U", "L", "B", "H", "0"]
+                choices = ["U", "C", "V", "N", "L", "B", "H", "0"]
             else:
-                choices = ["M", "V", "L", "B", "H", "0"]
+                choices = ["M", "V", "N", "L", "B", "H", "0"]
             choice = Prompt.ask("选择操作", choices=choices, default="0").upper()
 
             if choice == "M":
                 self.action_mount()
             elif choice == "U":
                 self.action_unmount()
+            elif choice == "C":
+                self.action_validate()
             elif choice == "V":
                 self.action_toggle_format()
+            elif choice == "N":
+                self.action_toggle_compact()
             elif choice == "L":
                 self.action_view_log()
             elif choice == "B":

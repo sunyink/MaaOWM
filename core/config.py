@@ -29,6 +29,8 @@ class OverlayConfig:
     base_layer_paths_resolved: List[pathlib.Path]  # base 目录列表 (绝对)
     maa_pkg_dir: Optional[pathlib.Path]          # 显式 maa 包目录 (绝对)
     output_format: str = "v2"                    # "v2" (默认) 或 "v1"
+    compact_node_refs: bool = True               # next/on_error 紧凑写法 ([JumpBack]name)
+    compact_node_refs: bool = True               # next/on_error 紧凑写法 (默认 True)
 
     def base_layer_paths(self) -> List[pathlib.Path]:
         return self.base_layer_paths_resolved
@@ -129,6 +131,15 @@ def load_config(config_path: pathlib.Path) -> OverlayConfig:
             )
         output_format = of
 
+    compact_node_refs = True
+    if "compact_node_refs" in raw:
+        cr = raw["compact_node_refs"]
+        if not isinstance(cr, bool):
+            raise ConfigError(
+                f"compact_node_refs 必须是 true/false, 实际: {cr!r}"
+            )
+        compact_node_refs = cr
+
     return OverlayConfig(
         config_path=config_path,
         config_root=config_root,
@@ -136,6 +147,7 @@ def load_config(config_path: pathlib.Path) -> OverlayConfig:
         base_layer_paths_resolved=base_layer_paths,
         maa_pkg_dir=maa_pkg_dir,
         output_format=output_format,
+        compact_node_refs=compact_node_refs,
     )
 
 
@@ -158,11 +170,29 @@ def set_output_format_in_config(
     )
 
 
+def set_compact_node_refs_in_config(
+    config_path: pathlib.Path,
+    enabled: bool,
+) -> None:
+    """原地修改 compact_node_refs 字段, 保留其他内容。"""
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"enabled 必须是 bool, 实际: {enabled!r}")
+    text = config_path.read_text(encoding="utf-8-sig")
+    raw = json.loads(text)
+    raw["compact_node_refs"] = enabled
+    config_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
+    )
+
+
 SAMPLE_CONFIG = {
     "target": "assets/resource/PC",
     "base_layers": ["assets/resource/base"],
     "maa_pkg_dir": None,
     "output_format": "v2",
+    "//compact_node_refs": "next/on_error 等节点引用是否使用紧凑字符串写法 ('[JumpBack]Foo' 而非 {name:'Foo', jump_back:true}); 默认 true, 大多数项目期望此风格",
+    "compact_node_refs": True,
 }
 
 
