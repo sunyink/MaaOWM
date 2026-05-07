@@ -35,12 +35,16 @@ import sys
 from typing import Callable, Dict, List, Optional
 
 from . import config as config_mod
+from . import def_table
 from . import diff
 from . import oracle
 from . import routing
 from . import snapshot
 
 ProgressCb = Optional[Callable[[str], None]]
+
+
+DEF_TABLES_FILENAME = "def_tables.json"
 
 
 OWM_README_TEXT = """\
@@ -275,7 +279,10 @@ def mount(
     cb("备份原 mod 包 (mod_og)...")
     og_dir = _backup_dir(cfg, "mod_og")
     og_count = _copy_pipeline_only(cfg.workspace_pipeline_dir(), og_dir / cfg.pipeline_subdir)
-    cb(f"  备份: {og_dir.name} ({og_count} 文件)")
+    if og_count == 0:
+        cb(f"  备份: {og_dir.name} (0 文件, mod 目录为空 — 首次挂载场景)")
+    else:
+        cb(f"  备份: {og_dir.name} ({og_count} 文件)")
 
     # canonicalize base
     cb("canonicalize base 层...")
@@ -291,14 +298,49 @@ def mount(
     snap_path = snapshot.write_snapshot(snap, cfg.owm_dir)
     cb(f"  快照: {snap_path.name}")
 
-    # canonicalize base + mod (要的是合并后的工作区内容)
-    cb("canonicalize base + mod (生成工作区内容)...")
-    try:
-        canonical_merged = oracle.canonicalize_overlay(
-            *cfg.base_pipeline_dirs(), cfg.workspace_pipeline_dir()
+    # 探 def 表 (按 type 一一探针, 失败的静默跳过)
+    cb("探 def 表 (按 type)...")
+    base_for_probe = cfg.base_pipeline_dirs()[0]   # 用第一个 base 层做探针上下文
+    def_tables = def_table.build_def_tables(base_for_probe)
+    cb(
+        f"  reco 白名单 ({len(def_tables.reco_param)}): "
+        f"{sorted(def_tables.reco_param.keys())}"
+    )
+    cb(
+        f"  action 白名单 ({len(def_tables.action_param)}): "
+        f"{sorted(def_tables.action_param.keys())}"
+    )
+    if def_tables.failed_types:
+        cb(
+            f"  探针失败 ({len(def_tables.failed_types)}): "
+            f"{def_tables.failed_types[:5]}"
+            + ("..." if len(def_tables.failed_types) > 5 else "")
         )
-    except oracle.OracleError as e:
-        raise MountError(f"加载 base+mod 合并失败: {e}") from None
+    (cfg.owm_dir / DEF_TABLES_FILENAME).write_text(
+        def_tables.to_json(), encoding="utf-8"
+    )
+
+    # canonicalize base + mod (要的是合并后的工作区内容)
+    # 边界: mod 目录可能为空 (首次挂载常见). MaaFW 的 post_pipeline
+    # 对空目录会报 load_all_json failed, 此时直接复用 canonical_base 即可。
+    mod_dir = cfg.workspace_pipeline_dir()
+    mod_has_json = any(
+        p.is_file() and p.suffix.lower() in (".json", ".jsonc")
+        and not any(part.startswith(".") for part in p.relative_to(mod_dir).parts)
+        for p in mod_dir.rglob("*")
+    )
+
+    if not mod_has_json:
+        cb("mod 目录为空, 跳过 mod 加载, 工作区 = base canonical")
+        canonical_merged = canonical_base
+    else:
+        cb("canonicalize base + mod (生成工作区内容)...")
+        try:
+            canonical_merged = oracle.canonicalize_overlay(
+                *cfg.base_pipeline_dirs(), mod_dir
+            )
+        except oracle.OracleError as e:
+            raise MountError(f"加载 base+mod 合并失败: {e}") from None
     cb(f"  合并 canonical: {len(canonical_merged)} task")
 
     # 建 origin 索引 — 注意此时 mod 还是原状 (清空前)
@@ -395,6 +437,23 @@ def unmount(
     if hints:
         cb(f"  hints: {len(hints)} 条")
 
+    # 读 def 表 (挂载时存的) 并应用 def 剥离
+    def_path = cfg.owm_dir / DEF_TABLES_FILENAME
+    if def_path.exists():
+        cb("应用 def 剥离 (按 type 查表)...")
+        try:
+            def_tables = def_table.DefTables.from_json(
+                def_path.read_text(encoding="utf-8")
+            )
+            stripped = def_table.strip_mod_with_def(
+                diff_result.minimal_mod, def_tables, canonical_w
+            )
+            cb(f"  剥离 {stripped} 个 def 字段")
+        except Exception as e:
+            warnings.append(f"def 剥离失败 (产物保留全字段): {e}")
+    else:
+        warnings.append("def 表缺失, 跳过剥离 (产物可能含冗余 def 字段)")
+
     # 读 origin 索引
     cb("读取 origin 索引...")
     origin_path = cfg.owm_dir / ORIGIN_INDEX_FILENAME
@@ -427,6 +486,7 @@ def unmount(
     # 删除 snapshot 和 origin 索引 (挂载状态结束)
     (cfg.owm_dir / snapshot.SNAPSHOT_FILENAME).unlink(missing_ok=True)
     origin_path.unlink(missing_ok=True)
+    (cfg.owm_dir / DEF_TABLES_FILENAME).unlink(missing_ok=True)
 
     _log(cfg, f"[UNMOUNT-OK] mod_files={len(written)} counts={counts} backup={work_backup.name}")
 
