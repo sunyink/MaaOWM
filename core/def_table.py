@@ -456,6 +456,12 @@ def strip_mod_with_def(
         # 当前 task 在 canonical_base 中的对应数据 (V0.7.3 双重判定)
         base_task = canonical_base.get(task_name) if canonical_base else None
 
+        # ★ V0.7.5 修复: MOD_ONLY task (base 不含此 task) 应等同"不带 base 对比"
+        # 否则 base_val 全是 None, 永远不满足 "base_val == def" → 该剥的不剥
+        # 语义: base 没设这个 task, 等价于 base 全用 def, 让 def 剥离按 def 走即可
+        effective_base = base_task if (base_task is not None) else None
+        use_base_compare = (canonical_base is not None and base_task is not None)
+
         # ── 1. recognition.param ──
         reco = task_def.get("recognition")
         if isinstance(reco, dict):
@@ -486,7 +492,7 @@ def strip_mod_with_def(
                     base_reco = base_task.get("recognition") if isinstance(base_task, dict) else None
                     base_param = base_reco.get("param") if isinstance(base_reco, dict) else None
                     base_box_index = base_param.get("box_index", 0) if isinstance(base_param, dict) else 0
-                    if canonical_base is None or base_box_index == 0:
+                    if not use_base_compare or base_box_index == 0:
                         del param["box_index"]
                         total += 1
 
@@ -539,7 +545,7 @@ def strip_mod_with_def(
                 )
                 if not wf:
                     # 仅当 base 同字段也整段是 def 时才删 (即 base 没设过)
-                    if canonical_base is None or (
+                    if not use_base_compare or (
                         not isinstance(base_wf, dict)
                         or base_wf == def_tables.wait_freezes
                         or base_wf == {}
@@ -558,7 +564,7 @@ def strip_mod_with_def(
                     base_dict=base_d if isinstance(base_d, dict) else None,
                 )
                 if not d:
-                    if canonical_base is None or (
+                    if not use_base_compare or (
                         not isinstance(base_d, dict)
                         or base_d == d_def
                         or base_d == {}
@@ -576,7 +582,7 @@ def strip_mod_with_def(
             if task_def[key] == def_tables.task_top[key]:
                 # 双重判定: base 同字段也是 def 才剥
                 base_val = base_task.get(key) if isinstance(base_task, dict) else None
-                if canonical_base is None or base_val == def_tables.task_top[key]:
+                if not use_base_compare or base_val == def_tables.task_top[key]:
                     del task_def[key]
                     total += 1
 
@@ -1161,6 +1167,38 @@ def _self_test() -> bool:
         all_ok = False
         print(f"  ✗ case 16: 实际 {json.dumps(mod16, ensure_ascii=False)}")
         print(f"            期望 {json.dumps(expected16, ensure_ascii=False)}")
+
+    # case 17: ★ V0.7.5 修复 — MOD_ONLY task (base 不含此 task) 应正常剥离 def 字段
+    # 不能因为 base 没该 task, 双重判定全失效, 导致全字段保留
+    mod17 = {
+        "NewTask": {                  # base 没此 task
+            "enabled": True,           # def → 应剥
+            "inverse": False,          # def → 应剥
+            "max_hit": 4294967295,     # def → 应剥
+            "next": ["X"],             # 用户值, 保留
+            "post_delay": 200,         # def → 应剥
+            "pre_delay": 500,          # 用户值, 保留
+            "action": "Custom",
+            "custom_action": "test",
+        }
+    }
+    cb17 = {"OtherTask": {}}           # canonical_base 不含 NewTask (MOD_ONLY)
+    strip_mod_with_def(mod17, def_tables, canonical_base=cb17)
+    expected17 = {
+        "NewTask": {
+            "next": ["X"],
+            "pre_delay": 500,
+            "action": "Custom",
+            "custom_action": "test",
+        }
+    }
+    ok = mod17 == expected17
+    if ok:
+        print(f"  ✓ case 17: MOD_ONLY task 也正常剥 def (V0.7.5 修)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 17: 实际 {json.dumps(mod17, ensure_ascii=False)}")
+        print(f"            期望 {json.dumps(expected17, ensure_ascii=False)}")
 
     return all_ok
 

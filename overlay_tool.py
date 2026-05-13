@@ -31,11 +31,12 @@ except ImportError:
 
 from core import config as config_mod
 from core import diff
+from core import env_check
 from core import inplace
 from core import preflight
 
 
-VERSION = "0.7.3"
+VERSION = "0.7.5"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
@@ -192,6 +193,9 @@ class OverlayToolApp:
             self.console.print("[yellow]操作取消[/yellow]")
             return
 
+        # 预检 maa 环境
+        if not self._precheck_maa_env():
+            return
         try:
             result = inplace.mount(
                 self.config,
@@ -232,6 +236,10 @@ class OverlayToolApp:
         self.console.print(f"  next/on_error: {compact_label}\n")
         if not Confirm.ask("确认继续卸载?", default=True):
             self.console.print("[yellow]操作取消[/yellow]")
+            return
+
+        # 预检 maa 环境
+        if not self._precheck_maa_env():
             return
 
         try:
@@ -303,6 +311,11 @@ class OverlayToolApp:
         """检查工作区: 预检语法 + 文件级变动统计 (dry-run, 不动任何文件)。"""
         assert self.config is not None
         self.console.print("\n[bold]━━━ 检查工作区 ━━━[/bold]\n")
+
+        # 预检 maa 环境
+        if not self._precheck_maa_env():
+            return
+
         try:
             inplace.oracle.init(self.config.maa_pkg_dir)
         except inplace.oracle.OracleError as e:
@@ -388,6 +401,16 @@ class OverlayToolApp:
             self.console.print(
                 "  [dim]→ 无可卸载内容, 卸载也不会产生 mod 文件.[/dim]"
             )
+
+    def _precheck_maa_env(self) -> bool:
+        """检查 maa 环境是否可用. 失败时打印诊断并返回 False."""
+        assert self.config is not None
+        err = env_check.precheck(self.config)
+        if err is None:
+            return True
+        self.console.print()
+        self.console.print(err.formatted_message)
+        return False
 
     def action_help(self):
         self.console.print()
