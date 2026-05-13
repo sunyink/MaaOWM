@@ -303,9 +303,18 @@ def build_def_tables(base_dir: pathlib.Path, verbose: bool = False) -> DefTables
 # 剥离 (按白名单, 黑名单整段保留)
 # ============================================================
 
-def _strip_dict_by_def(target: dict, def_dict: dict) -> int:
+def _strip_dict_by_def(
+    target: dict,
+    def_dict: dict,
+    base_dict: Optional[dict] = None,
+) -> int:
     """对 target dict 内每个键, 值等于 def_dict 同名键 → 删除。
     嵌套 dict 也递归。返回删除字段数。
+
+    base_dict (V0.7.3): 可选的 base 对照 dict (canonical_base 对应位置)。
+      传入时启用"双重判定": 仅当字段值 == def AND base 同字段值 == def 时才剥
+      避免误剥"用户在 mod 写 def 值, 想覆盖 base 非 def 值"的情况
+      未传入时退化为旧行为 (仅按 def 剥), 适合 mount 端 (工作区独立加载)
     """
     if not isinstance(target, dict) or not isinstance(def_dict, dict):
         return 0
@@ -315,14 +324,24 @@ def _strip_dict_by_def(target: dict, def_dict: dict) -> int:
             continue
         t_val, d_val = target[key], def_dict[key]
         if isinstance(t_val, dict) and isinstance(d_val, dict):
-            inner = _strip_dict_by_def(t_val, d_val)
+            # 递归: base_dict 对应子 dict 也传下去 (取不到时为 None, 继续保守剥)
+            inner_base = None
+            if isinstance(base_dict, dict):
+                bv = base_dict.get(key)
+                if isinstance(bv, dict):
+                    inner_base = bv
+            inner = _strip_dict_by_def(t_val, d_val, inner_base)
             removed += inner
             if not t_val:
+                # 子 dict 剥光: 仅当 base 该字段也是空 dict 或值等于 def 时才删
+                if base_dict is None or base_dict.get(key) == d_val or base_dict.get(key) == {}:
+                    del target[key]
+                    removed += 1
+        elif t_val == d_val:
+            # 标量: 双重判定
+            if base_dict is None or base_dict.get(key) == d_val:
                 del target[key]
                 removed += 1
-        elif t_val == d_val:
-            del target[key]
-            removed += 1
     return removed
 
 
@@ -347,7 +366,11 @@ def _resolve_type(
     return None
 
 
-def _strip_sub_recognition(sub_node: Any, def_tables: "DefTables") -> int:
+def _strip_sub_recognition(
+    sub_node: Any,
+    def_tables: "DefTables",
+    base_sub_node: Optional[Any] = None,
+) -> int:
     """剥离 And/Or 内的 sub-recognition (在 all_of/any_of 数组里).
 
     输入可能是:
@@ -358,6 +381,10 @@ def _strip_sub_recognition(sub_node: Any, def_tables: "DefTables") -> int:
           1. 按 recognition.type 剥 recognition.param 内 def 字段
           2. recognition.param 全空 → 删 param
           3. sub_name == recognition.type → 删 sub_name (parser 会自动回填)
+    
+    base_sub_node (V0.7.3): canonical_base 中对应位置的 sub_node, 
+      用于双重判定 (字段值 == def AND base 同字段也 == def 才剥)。
+      不传时退化为旧行为。
     返回删除字段数。
     """
     if not isinstance(sub_node, dict):
@@ -365,12 +392,17 @@ def _strip_sub_recognition(sub_node: Any, def_tables: "DefTables") -> int:
     removed = 0
 
     reco = sub_node.get("recognition")
+    base_reco = base_sub_node.get("recognition") if isinstance(base_sub_node, dict) else None
     if isinstance(reco, dict):
         r_type = reco.get("type")
         if r_type and r_type in def_tables.reco_param:
             param = reco.get("param")
+            base_param = base_reco.get("param") if isinstance(base_reco, dict) else None
             if isinstance(param, dict):
-                removed += _strip_dict_by_def(param, def_tables.reco_param[r_type])
+                removed += _strip_dict_by_def(
+                    param, def_tables.reco_param[r_type],
+                    base_dict=base_param if isinstance(base_param, dict) else None,
+                )
                 if not param:
                     del reco["param"]
                     removed += 1
@@ -388,20 +420,26 @@ def strip_mod_with_def(
     mod: Dict[str, dict],
     def_tables: DefTables,
     canonical_w: Optional[Dict[str, dict]] = None,
+    canonical_base: Optional[Dict[str, dict]] = None,
 ) -> int:
     """对 mod (in-place) 应用 def 剥离, 返回删除的字段总数。
 
     canonical_w: worktime 的 canonical, 用于查 task 当前 type
                  (mod 自己若没写 type 字段, 我们仍要知道用哪个 def 表)
+    canonical_base (V0.7.3): base 的 canonical (从 snapshot 拿), 用于"双重判定"
+                 unmount 端传入: 仅当字段值 == def AND base 同字段也 == def 才剥
+                                避免误剥"mod 写 def 值想覆盖 base 非 def 值"的情况
+                 mount 端不传: 剥离对象是 canonical_merged, 工作区独立加载靠 def
+                              base 是什么不影响, 现状仅按 def 表剥即可
 
-    剥离规则 (V0.6.1, verify_workspace_minimal_v2 验证 round-trip 闭合):
+    剥离规则:
       1. recognition.param 内字段按 type 剥
       2. action.param 内字段按 type 剥
       3. wait_freezes 内字段按其 def 剥 (单一类型)
       4. attach/anchor 嵌套 dict 内字段按 task_top def 剥
-      5. task 顶层标量/列表字段按 task_top def 剥 (★ V0.6.1 加)
-      6. And 的 box_index == 0 删 (★ V0.6.1 加)
-      7. And/Or 的 sub-recognition 数组递归剥 (★ V0.6.1 加)
+      5. task 顶层标量/列表字段按 task_top def 剥
+      6. And 的 box_index == 0 删
+      7. And/Or 的 sub-recognition 数组递归剥
     """
     total = 0
     # 顶层"非 def 字段域"白名单 — 这些字段由专用逻辑处理, 不参与通用顶层剥离
@@ -415,14 +453,23 @@ def strip_mod_with_def(
         if not isinstance(task_def, dict):
             continue
 
+        # 当前 task 在 canonical_base 中的对应数据 (V0.7.3 双重判定)
+        base_task = canonical_base.get(task_name) if canonical_base else None
+
         # ── 1. recognition.param ──
         reco = task_def.get("recognition")
         if isinstance(reco, dict):
             r_type = _resolve_type(reco, canonical_w, task_name, "recognition")
             if r_type and r_type in def_tables.reco_param:
                 param = reco.get("param")
+                # base 同位置的 reco.param
+                base_reco = base_task.get("recognition") if isinstance(base_task, dict) else None
+                base_reco_param = base_reco.get("param") if isinstance(base_reco, dict) else None
                 if isinstance(param, dict):
-                    total += _strip_dict_by_def(param, def_tables.reco_param[r_type])
+                    total += _strip_dict_by_def(
+                        param, def_tables.reco_param[r_type],
+                        base_dict=base_reco_param if isinstance(base_reco_param, dict) else None,
+                    )
                     if not param:
                         del reco["param"]
                         total += 1
@@ -435,8 +482,13 @@ def strip_mod_with_def(
             if r_type == "And" and isinstance(reco, dict):
                 param = reco.get("param", {})
                 if isinstance(param, dict) and param.get("box_index") == 0:
-                    del param["box_index"]
-                    total += 1
+                    # 双重判定: base 该字段也是 0 才剥
+                    base_reco = base_task.get("recognition") if isinstance(base_task, dict) else None
+                    base_param = base_reco.get("param") if isinstance(base_reco, dict) else None
+                    base_box_index = base_param.get("box_index", 0) if isinstance(base_param, dict) else 0
+                    if canonical_base is None or base_box_index == 0:
+                        del param["box_index"]
+                        total += 1
 
             # ── 7. And/Or 子嵌套递归剥 ──
             if r_type in ("And", "Or") and isinstance(reco, dict):
@@ -444,9 +496,17 @@ def strip_mod_with_def(
                 if isinstance(param, dict):
                     arr_key = "all_of" if r_type == "And" else "any_of"
                     arr = param.get(arr_key)
+                    base_reco = base_task.get("recognition") if isinstance(base_task, dict) else None
+                    base_param = base_reco.get("param") if isinstance(base_reco, dict) else None
+                    base_arr = base_param.get(arr_key) if isinstance(base_param, dict) else None
                     if isinstance(arr, list):
-                        for sub in arr:
-                            total += _strip_sub_recognition(sub, def_tables)
+                        for idx, sub in enumerate(arr):
+                            base_sub = (
+                                base_arr[idx]
+                                if isinstance(base_arr, list) and idx < len(base_arr)
+                                else None
+                            )
+                            total += _strip_sub_recognition(sub, def_tables, base_sub)
 
         # ── 2. action.param ──
         act = task_def.get("action")
@@ -454,8 +514,13 @@ def strip_mod_with_def(
             a_type = _resolve_type(act, canonical_w, task_name, "action")
             if a_type and a_type in def_tables.action_param:
                 param = act.get("param")
+                base_act = base_task.get("action") if isinstance(base_task, dict) else None
+                base_act_param = base_act.get("param") if isinstance(base_act, dict) else None
                 if isinstance(param, dict):
-                    total += _strip_dict_by_def(param, def_tables.action_param[a_type])
+                    total += _strip_dict_by_def(
+                        param, def_tables.action_param[a_type],
+                        base_dict=base_act_param if isinstance(base_act_param, dict) else None,
+                    )
                     if not param:
                         del act["param"]
                         total += 1
@@ -467,25 +532,41 @@ def strip_mod_with_def(
         for key in ("pre_wait_freezes", "post_wait_freezes", "repeat_wait_freezes"):
             wf = task_def.get(key)
             if isinstance(wf, dict) and def_tables.wait_freezes:
-                total += _strip_dict_by_def(wf, def_tables.wait_freezes)
+                base_wf = base_task.get(key) if isinstance(base_task, dict) else None
+                total += _strip_dict_by_def(
+                    wf, def_tables.wait_freezes,
+                    base_dict=base_wf if isinstance(base_wf, dict) else None,
+                )
                 if not wf:
-                    del task_def[key]
-                    total += 1
+                    # 仅当 base 同字段也整段是 def 时才删 (即 base 没设过)
+                    if canonical_base is None or (
+                        not isinstance(base_wf, dict)
+                        or base_wf == def_tables.wait_freezes
+                        or base_wf == {}
+                    ):
+                        del task_def[key]
+                        total += 1
 
         # ── 4. task 顶层嵌套 (attach/anchor) ──
         for key in ("attach", "anchor"):
             d = task_def.get(key)
             d_def = def_tables.task_top.get(key) if def_tables.task_top else None
             if isinstance(d, dict) and isinstance(d_def, dict):
-                total += _strip_dict_by_def(d, d_def)
+                base_d = base_task.get(key) if isinstance(base_task, dict) else None
+                total += _strip_dict_by_def(
+                    d, d_def,
+                    base_dict=base_d if isinstance(base_d, dict) else None,
+                )
                 if not d:
-                    del task_def[key]
-                    total += 1
+                    if canonical_base is None or (
+                        not isinstance(base_d, dict)
+                        or base_d == d_def
+                        or base_d == {}
+                    ):
+                        del task_def[key]
+                        total += 1
 
         # ── 5. ★ task 顶层标量/列表字段按 task_top def 剥 ──
-        # 例如: enabled:true, inverse:false, max_hit:4294967295, on_error:[],
-        #       post_delay:200, pre_delay:200, rate_limit:1000, repeat:1,
-        #       repeat_delay:0, timeout:20000, focus:None
         # 排除 SPECIAL_TOP_KEYS (它们由 1-4 规则单独处理)
         for key in list(task_def.keys()):
             if key in SPECIAL_TOP_KEYS:
@@ -493,8 +574,11 @@ def strip_mod_with_def(
             if key not in def_tables.task_top:
                 continue   # 不在 def 表里, 是 extras 或非 def 字段, 保留
             if task_def[key] == def_tables.task_top[key]:
-                del task_def[key]
-                total += 1
+                # 双重判定: base 同字段也是 def 才剥
+                base_val = base_task.get(key) if isinstance(base_task, dict) else None
+                if canonical_base is None or base_val == def_tables.task_top[key]:
+                    del task_def[key]
+                    total += 1
 
     return total
 
@@ -956,6 +1040,127 @@ def _self_test() -> bool:
             print(f"  ✗ case {i}: {name}")
             print(f"      期望: {json.dumps(mod_expected, ensure_ascii=False)}")
             print(f"      实际: {json.dumps(mod_actual, ensure_ascii=False)}")
+
+    # ─── V0.7.3 双重判定: canonical_base 对比 case ───
+    # 这些 case 需要传入 canonical_base, 不适合上面的循环, 独立跑
+
+    # case 13: base 设了非 def 值, mod 写 def 值 → 应保留 (新行为)
+    mod13 = {
+        "TaskM": {"pre_wait_freezes": {
+            "method": 5, "rate_limit": 1000, "target": True,
+            "target_offset": [0, 0, 0, 0], "threshold": 0.95,
+            "time": 0, "timeout": 20000,
+        }}  # 用户写 def 值
+    }
+    cb13 = {
+        "TaskM": {"pre_wait_freezes": {
+            "method": 5, "rate_limit": 1000, "target": True,
+            "target_offset": [0, 0, 0, 0], "threshold": 0.95,
+            "time": 3000,         # ← base 设了非 def 值
+            "timeout": 20000,
+        }}
+    }
+    strip_mod_with_def(mod13, def_tables, canonical_base=cb13)
+    # 期望: time 保留 (mod 写 0, base 是 3000, mod 想覆盖 base), 其他 def 字段剥
+    expected13 = {"TaskM": {"pre_wait_freezes": {"time": 0}}}
+    ok = mod13 == expected13
+    if ok:
+        print(f"  ✓ case 13: base 非 def + mod 写 def → 保留 (V0.7.3)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 13: 实际 {json.dumps(mod13, ensure_ascii=False)}")
+        print(f"            期望 {json.dumps(expected13, ensure_ascii=False)}")
+
+    # case 14: base 是 def, mod 也写 def → 应剥 (无意义字段)
+    mod14 = {
+        "TaskN": {"pre_wait_freezes": {
+            "method": 5, "rate_limit": 1000, "target": True,
+            "target_offset": [0, 0, 0, 0], "threshold": 0.95,
+            "time": 0, "timeout": 20000,
+        }}
+    }
+    cb14 = {
+        "TaskN": {"pre_wait_freezes": {
+            "method": 5, "rate_limit": 1000, "target": True,
+            "target_offset": [0, 0, 0, 0], "threshold": 0.95,
+            "time": 0,           # ← base 也是 def 值
+            "timeout": 20000,
+        }}
+    }
+    strip_mod_with_def(mod14, def_tables, canonical_base=cb14)
+    # 期望: 全剥 (mod 写值 = base 值 = def, 写不写都一样)
+    expected14 = {"TaskN": {}}
+    ok = mod14 == expected14
+    if ok:
+        print(f"  ✓ case 14: base def + mod def → 全剥 (V0.7.3)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 14: 实际 {json.dumps(mod14, ensure_ascii=False)}")
+
+    # case 15: 顶层标量 — base 改过 post_delay, mod 想重置
+    mod15 = {
+        "TaskO": {"post_delay": 200}  # 用户写 def 值
+    }
+    cb15 = {
+        "TaskO": {"post_delay": 5000}  # base 改过
+    }
+    strip_mod_with_def(mod15, def_tables, canonical_base=cb15)
+    expected15 = {"TaskO": {"post_delay": 200}}
+    ok = mod15 == expected15
+    if ok:
+        print(f"  ✓ case 15: 顶层标量, base 非 def + mod def → 保留 (V0.7.3)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 15: 实际 {json.dumps(mod15, ensure_ascii=False)}")
+
+    # case 16: recognition.param 字段 — base 改过 threshold, mod 重置为 0.3
+    mod16 = {
+        "TaskP": {
+            "recognition": {
+                "type": "OCR",
+                "param": {
+                    "expected": ["X"],
+                    "threshold": 0.3,
+                    "color_filter": "", "model": "", "only_rec": False,
+                    "replace": [], "index": 0, "order_by": "Horizontal",
+                    "roi": [0, 0, 0, 0], "roi_offset": [0, 0, 0, 0],
+                }
+            }
+        }
+    }
+    cb16 = {
+        "TaskP": {
+            "recognition": {
+                "type": "OCR",
+                "param": {
+                    "expected": ["X"],
+                    "threshold": 0.7,   # base 改过
+                    "color_filter": "", "model": "", "only_rec": False,
+                    "replace": [], "index": 0, "order_by": "Horizontal",
+                    "roi": [0, 0, 0, 0], "roi_offset": [0, 0, 0, 0],
+                }
+            }
+        }
+    }
+    strip_mod_with_def(mod16, def_tables, canonical_base=cb16)
+    expected16 = {
+        "TaskP": {"recognition": {"type": "OCR", "param": {"threshold": 0.3}}}
+    }
+    # expected 字段: threshold 保留 (用户重置), expected 同 base 不剥 (这字段不在 def 表)
+    # 不对, expected 在 def 表里是 [], 而 mod 是 ["X"], base 也是 ["X"]
+    # mod 值 != def → 不进 def 剥离判断 → 保留 ["X"]
+    expected16 = {
+        "TaskP": {"recognition": {"type": "OCR", "param": {
+            "expected": ["X"], "threshold": 0.3,
+        }}}
+    }
+    ok = mod16 == expected16
+    if ok:
+        print(f"  ✓ case 16: reco.param 字段双重判定 (V0.7.3)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 16: 实际 {json.dumps(mod16, ensure_ascii=False)}")
+        print(f"            期望 {json.dumps(expected16, ensure_ascii=False)}")
 
     return all_ok
 

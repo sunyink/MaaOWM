@@ -434,6 +434,12 @@ def mount(
         cb("  next/on_error 紧凑写法...")
         translator.simplify_node_refs_in_pipeline(pipeline_to_write)
 
+    # wait_freezes 紧凑写法 (V0.7.3): 仅 time 字段 → 标量
+    cb("  wait_freezes 紧凑写法...")
+    wf_simplified = translator.simplify_wait_freezes_in_pipeline(pipeline_to_write)
+    if wf_simplified:
+        cb(f"  简化 {wf_simplified} 个 wait_freezes 字段")
+
     # extras 注入 (V0.7.0): 把 doc/desc 等非 MaaFW 字段塞回每个 task
     cb("  注入 extras (doc/desc 等非 MaaFW 字段)...")
     injected = extras_mod.inject_extras_into_pipeline(pipeline_to_write, extras_snap)
@@ -586,13 +592,15 @@ def unmount(
     # 读 def 表 (挂载时存的) 并应用 def 剥离
     def_path = cfg.owm_dir / DEF_TABLES_FILENAME
     if def_path.exists():
-        cb("应用 def 剥离 (按 type 查表)...")
+        cb("应用 def 剥离 (按 type 查表, 双重判定: def 且 base 也 def)...")
         try:
             def_tables = def_table.DefTables.from_json(
                 def_path.read_text(encoding="utf-8")
             )
             stripped = def_table.strip_mod_with_def(
-                diff_result.minimal_mod, def_tables, canonical_w
+                diff_result.minimal_mod, def_tables,
+                canonical_w=canonical_w,
+                canonical_base=canonical_base,    # V0.7.3 双重判定
             )
             cb(f"  剥离 {stripped} 个 def 字段")
         except Exception as e:
@@ -630,6 +638,12 @@ def unmount(
     if cfg.compact_node_refs:
         cb("  next/on_error 紧凑写法...")
         translator.simplify_node_refs_in_pipeline(minimal_to_write)
+
+    # wait_freezes 紧凑写法 (V0.7.3): 仅 time 字段 → 标量
+    cb("  wait_freezes 紧凑写法...")
+    wf_simplified = translator.simplify_wait_freezes_in_pipeline(minimal_to_write)
+    if wf_simplified:
+        cb(f"  简化 {wf_simplified} 个 wait_freezes 字段")
 
     # 注入 workspace extras 到 minimal_mod (V0.7.0)
     # 仅对 minimal_mod 中存在的 task 注入 (即用户改过的 task)

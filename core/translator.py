@@ -212,6 +212,46 @@ def simplify_node_refs_in_pipeline(
 
 
 # ============================================================
+# wait_freezes 紧凑写法 (V0.7.3)
+# ============================================================
+
+_WAIT_FREEZES_KEYS = ("pre_wait_freezes", "post_wait_freezes", "repeat_wait_freezes")
+
+
+def simplify_wait_freezes_in_task(task: Dict[str, Any]) -> int:
+    """对单个 task 应用 wait_freezes 紧凑写法 (in-place)。返回简化数。
+
+    parser 接受标量数字作为 wait_freezes (PipelineParser.cpp 第 1534-1538 行):
+      pre_wait_freezes: 3000 等价于 pre_wait_freezes: {time: 3000}
+
+    仅当 wait_freezes dict 仅含 time 一个字段时, 退化为标量 time 值。
+    其他字段存在时保留 dict 形态.
+    """
+    if not isinstance(task, dict):
+        return 0
+    simplified = 0
+    for key in _WAIT_FREEZES_KEYS:
+        v = task.get(key)
+        if isinstance(v, dict) and len(v) == 1 and "time" in v:
+            time_val = v["time"]
+            if isinstance(time_val, (int, float)) and not isinstance(time_val, bool):
+                task[key] = time_val
+                simplified += 1
+    return simplified
+
+
+def simplify_wait_freezes_in_pipeline(
+    pipeline: Dict[str, Dict[str, Any]],
+) -> int:
+    """对整个 pipeline 应用 wait_freezes 紧凑写法 (in-place). 返回简化数."""
+    total = 0
+    for task in pipeline.values():
+        if isinstance(task, dict):
+            total += simplify_wait_freezes_in_task(task)
+    return total
+
+
+# ============================================================
 # 自检
 # ============================================================
 
@@ -535,6 +575,58 @@ def _self_test() -> bool:
     if not ok:
         print(f"      期望: {json.dumps(task_expected, ensure_ascii=False)}")
         print(f"      实际: {json.dumps(actual, ensure_ascii=False)}")
+
+    # ─── wait_freezes 紧凑写法自检 (V0.7.3) ───
+    print()
+    print("translator 自检 (wait_freezes 紧凑写法)")
+    print("─" * 60)
+
+    wf_cases = [
+        # (label, 输入 task, 期望 task)
+        ("仅 time 字段 → 标量",
+         {"pre_wait_freezes": {"time": 3000}},
+         {"pre_wait_freezes": 3000}),
+        ("time + 其他字段 → 不简化",
+         {"pre_wait_freezes": {"time": 3000, "threshold": 0.8}},
+         {"pre_wait_freezes": {"time": 3000, "threshold": 0.8}}),
+        ("time=0 也简化",
+         {"pre_wait_freezes": {"time": 0}},
+         {"pre_wait_freezes": 0}),
+        ("post_wait_freezes 同样处理",
+         {"post_wait_freezes": {"time": 500}},
+         {"post_wait_freezes": 500}),
+        ("repeat_wait_freezes 同样处理",
+         {"repeat_wait_freezes": {"time": 100}},
+         {"repeat_wait_freezes": 100}),
+        ("已是标量, 不动",
+         {"pre_wait_freezes": 3000},
+         {"pre_wait_freezes": 3000}),
+        ("空 dict 不动 (理论不该出现)",
+         {"pre_wait_freezes": {}},
+         {"pre_wait_freezes": {}}),
+        ("3 个字段都简化",
+         {
+             "pre_wait_freezes": {"time": 1000},
+             "post_wait_freezes": {"time": 2000},
+             "repeat_wait_freezes": {"time": 3000},
+         },
+         {
+             "pre_wait_freezes": 1000,
+             "post_wait_freezes": 2000,
+             "repeat_wait_freezes": 3000,
+         }),
+    ]
+    for label, t_in, t_expected in wf_cases:
+        t_actual = copy.deepcopy(t_in)
+        simplify_wait_freezes_in_task(t_actual)
+        ok = (t_actual == t_expected)
+        all_ok = all_ok and ok
+        if ok:
+            print(f"  ✓ {label}: {json.dumps(t_actual, ensure_ascii=False)}")
+        else:
+            print(f"  ✗ {label}")
+            print(f"      期望: {json.dumps(t_expected, ensure_ascii=False)}")
+            print(f"      实际: {json.dumps(t_actual, ensure_ascii=False)}")
 
     return all_ok
 
