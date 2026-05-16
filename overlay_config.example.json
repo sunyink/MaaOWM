@@ -1,0 +1,6 @@
+{
+    "target": "../你的MFA项目/assets/resource/PC",
+    "base_layers": ["../你的MFA项目/assets/resource/base"],
+    "output_format": "v2",
+    "compact_node_refs": true
+}

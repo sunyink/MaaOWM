@@ -36,43 +36,110 @@ from core import inplace
 from core import preflight
 
 
-VERSION = "0.7.5"
+VERSION = "0.7.6"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
 
 HELP_TEXT = """\
-[bold cyan]MaaOWM V3 — Overlay Workspace Manager[/bold cyan]
+[bold cyan]MaaOWM — MaaFramework Overlay Workspace Manager[/bold cyan]
 
-V3 委托 MaaFW 自己的 PipelineDumper 做语义合并, 你的 mod 包永远跟运行时
-真实合并行为对齐, 不会因为 MaaFW 升级或字段细节不同步而漂移。
+为多适配包项目 (base + PC/Mobile/...) 提供"挂载-编辑-卸载"工作流。
+挂载: 把 base+mod 合并成全字段工作区, 让编辑器看见完整世界。
+卸载: 把工作区和 base 做字段级 diff, 写回最小 mod 增量。
 
-[bold]工作流程:[/bold]
-  1. 准备 overlay_config.json
-  2. [M] 挂载 — 备份 mod, 把 base+mod 合并写入 mod 作为工作区
-  3. 用 MaaPipelineEditor 打开 mod 控制器编辑
-  4. 编辑完毕 → [U] 卸载 — diff 提取 minimal mod, 写回 mod 包
+[bold yellow]━━━ 第一次用 ━━━[/bold yellow]
 
-[bold]配置文件示例:[/bold]
-  {
-      "target": "assets/resource/PC",
-      "base_layers": ["assets/resource/base"],
-      "maa_pkg_dir": null
-  }
+  1. 准备 overlay_config.json (放在 MaaOWM 目录):
+       {
+           "target": "../你的项目/assets/resource/PC",
+           "base_layers": ["../你的项目/assets/resource/base"]
+       }
+     路径相对配置文件目录。target 是你要 overlay 编辑的适配包。base多包用,隔开。
 
-[bold]maa_pkg_dir:[/bold]
-  null    自动从 import maa 取包目录 (默认, 推荐)
-  路径    显式指向 site-packages/maa 级别 (覆盖自动检测)
+  2. 用项目虚拟环境的 Python 运行:
+       & "你的项目/.venv/Scripts/python.exe" overlay_tool.py   (Windows)
+     用错 Python 会触发 numpy 不兼容; 出错时会有友好诊断。
 
-[bold]工作区编辑准则 (重要):[/bold]
-  ✓ 改字段值 / 加新字段 / 新建 task
-  ✗ 不要从 task 删字段 (独立加载会退默认, 与意图不符)
-  ✗ 不要随便删被引用的 task (改 enabled:false 替代)
-  详见挂载后工作区根目录的 __OWM_README__.md
+  3. 按 [M] 挂载 → 用 MaaPipelineEditor / VSCode 打开 target 目录编辑
 
-[bold]V3 限制:[/bold]
-  - 输出 mod 永远是 V2 格式 (历史 V1 task 经 round-trip 会现代化)
-  - sub-object (recognition/action/attach 等) 字段级变化 → 整段写入
+  4. 编辑完按 [U] 卸载, target 目录变回干净的 minimal mod
+
+[bold yellow]━━━ 日常工作流 ━━━[/bold yellow]
+
+  [M] 挂载  →  用编辑器在 target 目录开发  →  [U] 卸载
+
+  挂载后 target 目录 = 全字段工作区 (易读, 编辑器看得见所有字段)
+  卸载后 target 目录 = minimal mod (干净, 仅你实际改动的)
+
+  挂载期间可以随时:
+    [C] 检查工作区状态 (变动统计 / 语法预检)
+    [B] 查看备份目录    [L] 查看上次操作日志
+
+[bold yellow]━━━ 主菜单速查 ━━━[/bold yellow]
+
+  [M]ount     挂载   备份 mod, 写入 base+mod 合并工作区
+  [U]nmount   卸载   diff 出 minimal mod, 写回适配包
+  [C]heck     检查   dry-run 验证工作区可加载 + 文件变动统计
+
+  [V]ersion   切 V1/V2 输出格式 (仅未挂载时可切)
+  [N]ode-refs 切 next/on_error 紧凑写法开关
+  [L]og       看上次操作日志
+  [B]ackup    列出 .maaowm/ 下的备份目录
+  [H]elp      本帮助
+  [Q]uit      退出
+
+[bold yellow]━━━ 工作区编辑准则 ━━━[/bold yellow]
+
+  [green]✓ 改字段值[/green]              post_delay: 3000 → 200
+  [green]✓ 给 task 加新字段[/green]
+  [green]✓ 新建 task[/green]
+  [green]✓ 改 / 加 / 删 doc/desc 注释[/green]
+
+  [red]✗ 不要删字段想"还原 base 值"[/red]
+     工作区独立加载, 缺失字段用框架默认值 (不是 base 的值)。
+     要还原 base 的某字段, 直接把值改成期望的形态。
+
+  [red]✗ 不要随意删被引用的 task[/red]
+     next/on_error 引用不存在的 task 会拒绝加载。
+     要让 task 失效, 改 enabled: false 而非删除。
+
+  [dim]删整字段 doc → mod 不写, 重挂载时 base 的 doc 恢复 (撤回修改)
+  要真正清空 → 写 doc: "" (显式空字符串)[/dim]
+
+[bold yellow]━━━ V1 / V2 输出格式选择 ━━━[/bold yellow]
+
+  [cyan]V2 (默认)[/cyan]  recognition/action 嵌套形态, 字段归属清晰
+       适合: 习惯 MaaFW Pipeline V2 文档标准写法
+
+  [cyan]V1[/cyan]         recognition 字段名拍平到 task 顶层
+       适合: 习惯 手写Pipeline 风格
+
+  [V] 切换 (仅未挂载时)。挂载状态切换会破坏 git diff, 已禁。
+
+[bold yellow]━━━ 出错了怎么办 ━━━[/bold yellow]
+
+  [red]启动报 numpy / maa 加载错误[/red]
+     大概率是 Python 解释器和 maa 所在环境不匹配。
+     按提示用该环境的 Python 重跑。
+
+  [red][U] 卸载提示"加载工作区失败"[/red]
+     工作区 JSON 有语法/字段错误。
+     用 VSCode + MaaSupport 插件查具体位置, 或按 [C] 看错误。
+
+  [red]改了 doc/desc 卸载后 mod 没变化[/red]
+     只改注释 + 该 task 没其他变动 → 自动检测到 extras 变化会写入。
+     如果你只是改了又改回去, oracle 看是 IDENTICAL, 确实不写。
+
+  [red]误操作了想恢复[/red]
+     [B] 查备份。.maaowm/<时间戳>/mod/ 是挂载前的样子。
+     work/ 是上次卸载前的工作区样子。
+
+[bold yellow]━━━ 进阶[/bold yellow]
+
+  • 挂载后工作区根目录有 __OWM_README__.md, 含编辑细节
+  • README.md   面向使用者的完整指引
+  • ARCHITECTURE.md  V3 设计文档, 给想理解原理或接手维护的人
 """
 
 
