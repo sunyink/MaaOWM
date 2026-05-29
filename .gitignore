@@ -46,3 +46,4 @@ htmlcov/
 
 # 本地配置 (开发者各自的 overlay_config.json 不入库)
 overlay_config.json
+.claude/settings.json

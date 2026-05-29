@@ -375,6 +375,11 @@ V3.7.2 extras diff — 单独改 doc/desc 也能写回 mod
 V3.7.3 双重判定剥离 + wait_freezes 紧凑写法
 V3.7.4 env_check — maa 环境友好诊断
 V3.7.5 MOD_ONLY task 剥离修复
+V3.7.7 custom_action_param / custom_recognition_param 原子保护
+        deep_diff 递归进这两个字段会剥掉"与 base 相同"的子字段,
+        但 MaaFW 对它们是整体替换而非 dict-merge, 导致 mod 加载后
+        运行时缺失必要参数。在 _ATOMIC_DICT_KEYS 中注册这两个字段,
+        阻止 deep_diff 递归, 确保 mod 始终携带完整 param dict。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。

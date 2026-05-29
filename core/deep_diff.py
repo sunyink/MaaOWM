@@ -28,6 +28,14 @@ _LIST_FIELDS: Set[str] = {
     # 任意其他列表型字段都默认不递归 (见 deep_diff_value 实现)
 }
 
+# 原子 dict 字段: MaaFW 对这些字段做整体替换而非 dict-merge,
+# 因此不能递归剥离 (否则 mod 只含变化子字段, 加载后其余字段从 base 丢失)
+# custom_action_param / custom_recognition_param 由自定义实现消费, MaaFW 不感知内部结构
+_ATOMIC_DICT_KEYS: Set[str] = {
+    "custom_action_param",
+    "custom_recognition_param",
+}
+
 
 def deep_diff_value(w_val: Any, b_val: Any, key_hint: str = "") -> Any:
     """对单个 (w, b) 值对做递归剥离, 返回应写入 mod 的值。
@@ -49,6 +57,10 @@ def deep_diff_value(w_val: Any, b_val: Any, key_hint: str = "") -> Any:
 
     # 标量或类型不一致: 整段保留
     if not isinstance(w_val, dict) or not isinstance(b_val, dict):
+        return w_val
+
+    # 原子 dict 字段: MaaFW 整体替换, 不能递归剥离
+    if key_hint in _ATOMIC_DICT_KEYS:
         return w_val
 
     # dict: 递归剥离
@@ -302,7 +314,41 @@ def _self_test() -> bool:
     ))
 
     # ───────────────────────────────────────────────────────
-    # case 11: 用户写空 attach, base 非空 (dict-merge 下无效操作, 剥离)
+    # case 11: custom_action_param 整段保留 (MaaFW 原子替换, 不递归剥离)
+    # 只有 replacement_list 变了, 但其他字段 (target_node 等) 必须一起输出,
+    # 否则 MaaFW 加载后 custom_action_param 只含 replacement_list, 运行缺参
+    # ───────────────────────────────────────────────────────
+    cases.append((
+        "custom_action_param 原子保留 (不递归剥离)",
+        {"action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "SomeAction",
+                "custom_action_param": {
+                    "unchanged_field": "same",
+                    "changed_field": "new_value",  # 变化
+                },
+            },
+        }},
+        {"action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "SomeAction",
+                "custom_action_param": {
+                    "unchanged_field": "same",
+                    "changed_field": "old_value",  # 原值
+                },
+            },
+        }},
+        # 期望: custom_action_param 整段保留 (两个字段全在), custom_action/type 相同剥离
+        {"action": {"param": {"custom_action_param": {
+            "unchanged_field": "same",
+            "changed_field": "new_value",
+        }}}},
+    ))
+
+    # ───────────────────────────────────────────────────────
+    # case 12: 用户写空 attach, base 非空 (dict-merge 下无效操作, 剥离)
     #         attach: {} 在 dict_merge 语义下等于"啥也没说", 不会清空 base
     #         物理结果与 case 7 同构: 整 attach 被剥离, 运行时 attach = base
     # ───────────────────────────────────────────────────────
