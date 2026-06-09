@@ -2,9 +2,8 @@
 
 # MaaOWM — MaaFramework Overlay Workspace Manager
 
-[![pip](https://img.shields.io/badge/requires-pip-3775A9?logo=pypi&logoColor=white)](https://pip.pypa.io)
-[![Rich](https://img.shields.io/badge/dep-rich-af00ff?logo=python&logoColor=white)](https://github.com/Textualize/rich)
-[![MaaFw](https://img.shields.io/badge/PyPI-MaaFw-3775A9?logo=pypi&logoColor=white)](https://pypi.org/project/MaaFw)
+![python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+[![Powered by MaaFramework](https://img.shields.io/badge/Powered%20by-MaaFramework-blue)](https://github.com/MaaXYZ/MaaFramework)
 [![License](https://img.shields.io/badge/License-MIT-blue)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/sunyink/MaaOWM?label=给项目点赞&color=f39c12&logo=github)](https://github.com/sunyink/MaaOWM)
 
