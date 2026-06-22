@@ -47,6 +47,46 @@ from . import translator
 ProgressCb = Optional[Callable[[str], None]]
 
 
+def _node_field_type(task: dict, field: str) -> Optional[str]:
+    """从 canonical task 提取 recognition/action 的 type 名 (兼容 dict / 字符串形态)。"""
+    v = task.get(field) if isinstance(task, dict) else None
+    if isinstance(v, dict):
+        return v.get("type")
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def detect_type_drift(
+    canonical_merged: Dict[str, dict],
+    canonical_base: Dict[str, dict],
+) -> List[str]:
+    """type 漂移护栏 (V3.7.8): 找出 mod override 的 recognition/action type 与 base
+    不同的节点。
+
+    overlay 语义是 mod 覆盖 base, 所以当 canonical_merged 某节点的 type 与
+    canonical_base 不同时, 一定是 mod 显式 override 了 type —— 这会 *静默盖住*
+    base 此处的逻辑, 而工作区只显示 mod 赢后的形态, 开发者无从察觉 base 已变。
+    返回每条漂移的警告文本。MOD_ONLY (base 无此节点) 不算, 没有 base 可盖。
+    """
+    warnings: List[str] = []
+    if canonical_merged is canonical_base:
+        return warnings   # mod 为空, 工作区即 base, 无漂移
+    for name, merged_task in canonical_merged.items():
+        base_task = canonical_base.get(name)
+        if not isinstance(base_task, dict) or not isinstance(merged_task, dict):
+            continue   # MOD_ONLY 新建节点, 无 base 可盖
+        for field in ("recognition", "action"):
+            m_t = _node_field_type(merged_task, field)
+            b_t = _node_field_type(base_task, field)
+            if m_t != b_t and (m_t or b_t):
+                warnings.append(
+                    f"节点 {name}: base {field} type={b_t}, 被 mod 覆盖为 {m_t} —— "
+                    f"mod 正盖住 base 此处逻辑; 若需跟随 base 请在工作区清理该节点 override"
+                )
+    return warnings
+
+
 DEF_TABLES_FILENAME = "def_tables.json"
 EXTRAS_FILENAME = "extras.json"
 
@@ -389,6 +429,12 @@ def mount(
         except oracle.OracleError as e:
             raise MountError(f"加载 base+mod 合并失败: {e}") from None
     cb(f"  合并 canonical: {len(canonical_merged)} task")
+
+    # type 漂移护栏 (V3.7.8): mod override 的 type 与 base 不同 → 静默盖住 base 逻辑
+    drift_warnings = detect_type_drift(canonical_merged, canonical_base)
+    if drift_warnings:
+        cb(f"  ⚠ 检测到 {len(drift_warnings)} 处 type 漂移 (mod 覆盖了 base 的 type)")
+        warnings.extend(drift_warnings)
 
     # 建 origin 索引 — 注意此时 mod 还是原状 (清空前)
     cb("建立 origin 索引...")

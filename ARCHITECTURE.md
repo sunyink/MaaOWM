@@ -351,6 +351,16 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 
 **对策**：`core/env_check.py` 在挂载/卸载/检查前预检，识别这类问题并给出友好诊断和精准的修复命令。不越权自动处理，让开发者自己决策。
 
+### 7.6 base type 漂移导致双重判定失效 + 挂载护栏
+
+**现象**：base 某节点的 recognition/action type 被改过（如 `And` → `OCR`、`DoNothing` → `Click`），工作区把该节点改成新 type 后卸载，产物带一大堆该 type 的默认空字段（`roi_offset:[0,0,0,0]`、`replace:[]`、`only_rec:false`、`threshold:0.3`、`contact:0` 等）没被剥离。
+
+**根因**：def 剥离的双重判定（见 [5.2](#52-双重判定剥离)）取 `base_task` 同位置的 `recognition.param` / `action.param` 做对照，但 base 是**旧 type**，它的 param 里根本没有新 type 的字段，`base_dict.get(key)` 全返回 `None`，永远不满足「base 值 == 默认值」→ 该剥的一个都剥不掉。与 [7.4](#74-mod_only-task-剥不掉-def-字段) 的 MOD_ONLY bug 同构：MOD_ONLY 是整个 task 在 base 中不存在；这个是 task 存在但 type 变了，等价于「该 type 下 base 不存在任何字段」。
+
+**对策**：`strip_mod_with_def()` 在剥 reco/action param 前，判断 base 该 task 的 `recognition.type` / `action.type` 是否与当前 type 一致。不一致时 base 对照传 `None`，退化为朴素剥离（base 旧 type 字段对新 type 无意义）。type 一致时仍走双重判定，保留 5.2 的保护语义。
+
+**关联护栏**（反向场景）：上面是「base 改 type、工作区跟随」。反过来，base 改了 type 但 **mod 仍 override 着旧 type** 时，overlay 语义是 mod 覆盖 base，合并后 type = mod 的旧 type，**静默盖住 base 的新逻辑**，而工作区只显示 mod 赢后的形态，开发者无从察觉 base 已变。`inplace.detect_type_drift()` 在挂载时对比 `canonical_merged` 与 `canonical_base` 的 reco/action type，发现不一致即发警告（机制类比 DELETED），补上这块信息缺失。
+
 ### 其他较小的修复
 
 - 空 mod 目录导致 oracle 加载失败 → 检测空 mod 跳过加载
@@ -380,6 +390,11 @@ V3.7.7 custom_action_param / custom_recognition_param 原子保护
         但 MaaFW 对它们是整体替换而非 dict-merge, 导致 mod 加载后
         运行时缺失必要参数。在 _ATOMIC_DICT_KEYS 中注册这两个字段,
         阻止 deep_diff 递归, 确保 mod 始终携带完整 param dict。
+V3.7.8 base type 漂移修复 + 挂载 type 漂移护栏
+        卸载端: base reco/action type 改变时双重判定失效, 默认字段剥不掉
+        (与 7.4 MOD_ONLY 同构) → type 不一致时退化朴素剥离。
+        挂载端: detect_type_drift 检测 mod override 盖住 base 新 type,
+        发警告补信息缺失 (见 7.6)。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。
@@ -441,4 +456,4 @@ V3 的核心不是某个算法，是**承认自己不是权威，把权威让给
 
 ---
 
-*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.5。*
+*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.8。*
