@@ -468,9 +468,14 @@ def strip_mod_with_def(
             r_type = _resolve_type(reco, canonical_w, task_name, "recognition")
             if r_type and r_type in def_tables.reco_param:
                 param = reco.get("param")
-                # base 同位置的 reco.param
+                # base 同位置的 reco.param —— 仅当 base 该 task 的 recognition type
+                # 与当前 type 一致时才用于双重判定。type 变了 (如 And→OCR) 时, base 旧
+                # type 的 param 字段对新 type 毫无意义, 全取到 None 会让双重判定永远不
+                # 成立 → 默认字段一个都剥不掉。此时退化为朴素剥离 (同 MOD_ONLY 思路)。
                 base_reco = base_task.get("recognition") if isinstance(base_task, dict) else None
-                base_reco_param = base_reco.get("param") if isinstance(base_reco, dict) else None
+                base_reco_param = None
+                if isinstance(base_reco, dict) and base_reco.get("type") == r_type:
+                    base_reco_param = base_reco.get("param")
                 if isinstance(param, dict):
                     total += _strip_dict_by_def(
                         param, def_tables.reco_param[r_type],
@@ -520,8 +525,13 @@ def strip_mod_with_def(
             a_type = _resolve_type(act, canonical_w, task_name, "action")
             if a_type and a_type in def_tables.action_param:
                 param = act.get("param")
+                # base 同位置的 action.param —— 同 recognition: 仅当 base 该 task 的
+                # action type 与当前一致时才双重判定。type 变了 (如 DoNothing→Click)
+                # 时退化为朴素剥离, 否则 Click 的默认字段全剥不掉。
                 base_act = base_task.get("action") if isinstance(base_task, dict) else None
-                base_act_param = base_act.get("param") if isinstance(base_act, dict) else None
+                base_act_param = None
+                if isinstance(base_act, dict) and base_act.get("type") == a_type:
+                    base_act_param = base_act.get("param")
                 if isinstance(param, dict):
                     total += _strip_dict_by_def(
                         param, def_tables.action_param[a_type],
@@ -1199,6 +1209,46 @@ def _self_test() -> bool:
         all_ok = False
         print(f"  ✗ case 17: 实际 {json.dumps(mod17, ensure_ascii=False)}")
         print(f"            期望 {json.dumps(expected17, ensure_ascii=False)}")
+
+    # case 18: ★ V0.7.8 修复 — base 该 task 的 reco/action type 改变时, 双重判定
+    # 应退化为朴素剥离。否则 base 旧 type 的 param 字段对新 type 全取到 None,
+    # 双重判定永不成立 → 默认字段一个都剥不掉 (与 case 17 MOD_ONLY 同构)。
+    mod18 = {
+        "Node": {                          # 工作区: OCR + Click
+            "recognition": {"type": "OCR", "param": {
+                "roi": [461, 404, 163, 110],   # 用户值, 保留
+                "expected": ["取消"],           # 用户值, 保留
+                "threshold": 0.3,               # def → 应剥
+                "only_rec": False,              # def → 应剥
+                "model": "",                    # def → 应剥
+            }},
+            "action": {"type": "Click", "param": {
+                "target": True,                 # def → 应剥
+                "contact": 0,                   # def → 应剥
+            }},
+        }
+    }
+    cb18 = {"Node": {                       # base: And + DoNothing (type 全变了)
+        "recognition": {"type": "And", "param": {"all_of": ["X"], "box_index": 0}},
+        "action": {"type": "DoNothing", "param": {}},
+    }}
+    strip_mod_with_def(mod18, def_tables, canonical_base=cb18)
+    expected18 = {
+        "Node": {
+            "recognition": {"type": "OCR", "param": {
+                "roi": [461, 404, 163, 110],
+                "expected": ["取消"],
+            }},
+            "action": {"type": "Click"},
+        }
+    }
+    ok = mod18 == expected18
+    if ok:
+        print(f"  ✓ case 18: base type 改变时退化朴素剥离 (V0.7.8 修)")
+    else:
+        all_ok = False
+        print(f"  ✗ case 18: 实际 {json.dumps(mod18, ensure_ascii=False)}")
+        print(f"            期望 {json.dumps(expected18, ensure_ascii=False)}")
 
     return all_ok
 
