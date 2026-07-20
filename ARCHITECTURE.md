@@ -395,6 +395,12 @@ V3.7.8 base type 漂移修复 + 挂载 type 漂移护栏
         (与 7.4 MOD_ONLY 同构) → type 不一致时退化朴素剥离。
         挂载端: detect_type_drift 检测 mod override 盖住 base 新 type,
         发警告补信息缺失 (见 7.6)。
+V3.7.9 base 基线漂移检测 (base') 落地 — 见 DESIGN-base-baseline.md
+        持久、手动 ack、进 git 的 base 基线 (core/baseline.py), 按 git 分支
+        隔离 (core/gitinfo.py); 双 canonicalize 消版本假阳性; 挂载发一行摘要,
+        TUI [R] 只读漂移面板 (文件列表→PR diff 详情→按文件复位)。
+        owm 文件统一到项目根 maaowm/ (.state/ 本地 + baseline/ 共享),
+        owm_dir 重指向 maaowm/.state/ (不做旧 .maaowm 自动迁移)。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。
@@ -416,6 +422,7 @@ V3.7.8 base type 漂移修复 + 挂载 type 漂移护栏
 - image / model 的 hash 级 diff（V2 曾有，V3 暂时砍掉）
 - 多适配包批量操作
 - 节点级删除的更智能处理（当前只警告）
+- **base 基线漂移检测（base'）**：检测 base 自 mod 创建以来的漂移、提醒 pc 是否需跟随。**已落地（V3.7.9）**，完整设计见 [DESIGN-base-baseline.md](DESIGN-base-baseline.md)：持久手动 ack 的 base 基线（`core/baseline.py`），按 git 分支隔离（`core/gitinfo.py`），TUI `[R]` 只读漂移面板。已落地的 type 漂移护栏（§7.6）是其轻量前身。
 - 打包成 pip 包分发（当前是 git clone 使用）
 
 ---
@@ -456,4 +463,4 @@ V3 的核心不是某个算法，是**承认自己不是权威，把权威让给
 
 ---
 
-*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.8。*
+*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.9。*

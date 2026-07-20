@@ -29,6 +29,7 @@ except ImportError:
     print("错误: 缺少 rich 库。请运行: pip install rich")
     sys.exit(1)
 
+from core import baseline as baseline_mod
 from core import config as config_mod
 from core import diff
 from core import env_check
@@ -36,7 +37,7 @@ from core import inplace
 from core import preflight
 
 
-VERSION = "0.7.7"
+VERSION = "0.7.9"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
@@ -81,6 +82,7 @@ HELP_TEXT = """\
   [M]ount     挂载   备份 mod, 写入 base+mod 合并工作区
   [U]nmount   卸载   diff 出 minimal mod, 写回适配包
   [C]heck     检查   dry-run 验证工作区可加载 + 文件变动统计
+  [R]eview    基线   base' 对照: 看 base 是否偏离、按文件复位基准 (只读, 不改文件)
 
   [V]ersion   切 V1/V2 输出格式 (仅未挂载时可切)
   [N]ode-refs 切 next/on_error 紧凑写法开关
@@ -218,6 +220,7 @@ class OverlayToolApp:
         else:
             items.append(("U", "卸载", "diff 提取 minimal mod, 写回 mod 包"))
             items.append(("C", "检查工作区", "预检语法 + 文件级变动统计 (dry-run)"))
+        items.append(("R", "base 基线漂移", "base' 对照: 看 base 是否偏离、按文件复位"))
         items.append(("V", "切换输出格式", "V2 ↔ V1 (下次写文件时生效)"))
         items.append(("N", "切换紧凑节点引用", "next/on_error: 字符串 ↔ object"))
         items += [
@@ -479,6 +482,213 @@ class OverlayToolApp:
         self.console.print(err.formatted_message)
         return False
 
+    # ============================================================
+    # [R] base 基线漂移面板 (base')  —— 只读铁律: 除复位/adopt/clean 外不动文件
+    # ============================================================
+
+    def action_review_drift(self):
+        """base' 漂移面板: 分支前置处理 → 建立基线 → 文件列表/详情 → 按文件复位。"""
+        assert self.config is not None
+        cfg = self.config
+        self.console.print("\n[bold]━━━ base 基线漂移 (base') ━━━[/bold]\n")
+        self.console.print(
+            "[dim]base 可能已偏离你做这份 mod 时的基准。下面按文件列出 base 的变动,\n"
+            "帮你判断 pc 是否需要跟随; 标「需 review」的是你 mod 改过、base 也改过的字段。\n"
+            "「复位本文件」= 你已确认处理完该文件, 将其基准推进到当前 base。\n"
+            "本面板只读, 绝不替你改工作区/mod; 原理见 DESIGN-base-baseline.md。[/dim]\n"
+        )
+
+        # 1. 解析分支 slug (无 git/detached 退化为单一基线)
+        slug, branch, reason = baseline_mod.effective_slug(cfg)
+        if reason:
+            self.console.print(f"  [yellow]![/yellow] {reason} (基线名: {slug})\n")
+        else:
+            self.console.print(f"  [dim]当前分支基线: {slug}[/dim]\n")
+
+        # 2. fork-adopt: 当前无基线但存在其他分支基线
+        if not baseline_mod.has_baseline(cfg, slug):
+            adoptable = baseline_mod.find_adoptable(cfg, slug)
+            if adoptable:
+                self.console.print(
+                    f"  当前分支尚无基线, 但发现其他分支基线: "
+                    f"[cyan]{', '.join(adoptable)}[/cyan]"
+                )
+                self.console.print(
+                    "  [dim]若本分支是从其中 fork 出来的, 可改名沿用 (无损), 否则另建新基线。[/dim]"
+                )
+                src = Prompt.ask(
+                    "  从哪个基线改名沿用? (留空=不沿用, 另建)",
+                    choices=adoptable + [""], default="", show_choices=False,
+                )
+                if src:
+                    if baseline_mod.adopt(cfg, src, slug, branch):
+                        self.console.print(
+                            f"  [green]✓ 已沿用 {src} → {slug}[/green]\n"
+                        )
+                    else:
+                        self.console.print("  [red]✗ 改名失败[/red]\n")
+
+        # 3. 仍无基线 → 提示建立 (= 初始化, 首次复位)
+        if not baseline_mod.has_baseline(cfg, slug):
+            self.console.print("  [yellow]尚未建立 base 基线 (base')。[/yellow]")
+            self.console.print(
+                "  [dim]建立 = 把当前 base 源文件原档存一份进 maaowm/baseline/, "
+                "之后每次都能对照出 base 漂移。[/dim]"
+            )
+            if not Confirm.ask("  现在建立基线?", default=True):
+                self.console.print("[yellow]操作取消[/yellow]")
+                return
+            n = baseline_mod.reset_all(cfg, slug, branch)
+            self.console.print(
+                f"  [green]✓ 基线已建立[/green] (原档 {n} 文件 → "
+                f"maaowm/baseline/{slug}/)\n"
+                "  [dim]这些文件需 git 提交以便团队共享。[/dim]"
+            )
+            return
+
+        # 4. self-clean: 孤儿基线 (对应分支已不存在)
+        orphans = baseline_mod.find_orphans(cfg, slug)
+        if orphans:
+            self.console.print(
+                f"  发现孤儿基线 (对应分支在 git 已不存在): [cyan]{', '.join(orphans)}[/cyan]"
+            )
+            if Confirm.ask("  清理这些孤儿基线目录?", default=False):
+                for o in orphans:
+                    baseline_mod.remove_baseline(cfg, o)
+                self.console.print(f"  [green]✓ 已清理 {len(orphans)} 个孤儿基线[/green]\n")
+
+        # 5. 检测 (需 oracle)
+        if not self._precheck_maa_env():
+            return
+        try:
+            inplace.oracle.init(cfg.maa_pkg_dir)
+        except inplace.oracle.OracleError as e:
+            self.console.print(f"[red]oracle 初始化失败: {e}[/red]")
+            return
+
+        mounted = self.state == STATE_MOUNTED
+        self._drift_panel_loop(cfg, slug, branch, mounted)
+
+    def _drift_panel_loop(self, cfg, slug, branch, mounted):
+        """文件列表 ↔ 详情的导航循环。每轮重新检测, 复位后实时收敛。"""
+        while True:
+            try:
+                report = baseline_mod.detect_drift(cfg, slug, mounted=mounted)
+            except Exception as e:
+                self.console.print(f"\n[red]✗ 漂移检测失败: {e}[/red]")
+                return
+
+            drift_files = [f for f in report.files if f.nodes]
+            if not drift_files:
+                self.console.print(
+                    "\n[green]✓ base 与基线一致, 无漂移。[/green]"
+                )
+                return
+
+            self.console.print()
+            self._render_drift_overview(drift_files)
+            sel = Prompt.ask(
+                "输入文件序号查看详情 (0 返回主菜单)", default="0",
+            )
+            if sel.strip() in ("0", ""):
+                return
+            try:
+                idx = int(sel) - 1
+            except ValueError:
+                continue
+            if not (0 <= idx < len(drift_files)):
+                continue
+
+            fd = drift_files[idx]
+            self.console.print()
+            self._render_drift_detail(fd)
+
+            # 详情页就地复位本文件
+            if Confirm.ask(
+                f"复位本文件基线? ([cyan]{fd.layer}/{fd.rel}[/cyan] 推进到当前 base)",
+                default=False,
+            ):
+                ok = baseline_mod.reset_file(cfg, slug, fd.layer, fd.rel, branch)
+                if ok:
+                    self.console.print(
+                        f"  [green]✓ 已复位 {fd.rel}[/green] [dim](记得 git 提交基线)[/dim]"
+                    )
+                else:
+                    self.console.print("  [red]✗ 复位失败[/red]")
+
+    @staticmethod
+    def _fmt_drift_val(v) -> str:
+        if v is baseline_mod.MISSING:
+            return "(无)"
+        try:
+            import json as _json
+            s = _json.dumps(v, ensure_ascii=False)
+        except (TypeError, ValueError):
+            s = str(v)
+        return s if len(s) <= 80 else s[:77] + "..."
+
+    def _render_drift_overview(self, drift_files):
+        """轻度概览: 文件列表 + 漂移数 + 几处需 review。"""
+        tbl = Table(
+            title="base 漂移文件列表", title_style="bold cyan",
+            box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 2),
+        )
+        tbl.add_column("#", justify="right", style="dim", no_wrap=True)
+        tbl.add_column("文件", style="white")
+        tbl.add_column("层", style="dim", no_wrap=True)
+        tbl.add_column("漂移", justify="right", no_wrap=True)
+        tbl.add_column("需review", justify="right", no_wrap=True)
+        tbl.add_column("文件级", no_wrap=True)
+        for i, fd in enumerate(drift_files, 1):
+            rc = fd.review_count()
+            fk = {"added": "[green]新增[/green]", "removed": "[red]删除[/red]",
+                  "modified": "[dim]改[/dim]"}.get(fd.file_kind, fd.file_kind)
+            tbl.add_row(
+                str(i), fd.rel, fd.layer, str(len(fd.nodes)),
+                f"[yellow]{rc}[/yellow]" if rc else "[dim]·[/dim]", fk,
+            )
+        self.console.print(tbl)
+
+    def _render_drift_detail(self, fd):
+        """重度报告: PR diff 风格 (文件 → 节点 → 字段 -/+/·)。"""
+        fk = {"added": "[green]文件新增[/green]", "removed": "[red]文件删除[/red]",
+              "modified": "改"}.get(fd.file_kind, fd.file_kind)
+        self.console.print(
+            f"[bold white]{fd.layer}/{fd.rel}[/bold white]  [{fk}]"
+        )
+        tag_style = {
+            "review": "yellow", "stale": "red", "dangling": "red", "info": "dim",
+        }
+        tag_label = {
+            "review": "需 review", "stale": "需 review · 疑似过时残留",
+            "dangling": "悬空 override", "info": "自动跟随 · 仅告知",
+        }
+        for nd in fd.nodes:
+            ts = tag_style.get(nd.tag, "white")
+            kind_cn = {"changed": "改", "added": "增", "removed": "删"}.get(nd.kind, nd.kind)
+            self.console.print(
+                f"  ▾ [bold]{nd.name}[/bold]  "
+                f"[{ts}]\\[{kind_cn} · {tag_label.get(nd.tag, nd.tag)}][/{ts}]"
+            )
+            for f in nd.fields:
+                self.console.print(f"      [dim]{f.field_path}[/dim]")
+                self.console.print(
+                    f"        [red]- {self._fmt_drift_val(f.baseline_val)}[/red]  "
+                    f"[dim](base' 基准)[/dim]"
+                )
+                self.console.print(
+                    f"        [green]+ {self._fmt_drift_val(f.now_val)}[/green]  "
+                    f"[dim](当前 base)[/dim]"
+                )
+                if f.mod_val is not baseline_mod.MISSING and f.tag != "info":
+                    self.console.print(
+                        f"        [cyan]· {self._fmt_drift_val(f.mod_val)}[/cyan]  "
+                        f"[dim](mod override 现值)[/dim]"
+                    )
+            if nd.note:
+                self.console.print(f"      [dim]参考: {nd.note}[/dim]")
+        self.console.print()
+
     def action_help(self):
         self.console.print()
         self.console.print(Panel(HELP_TEXT, title="使用说明", border_style="cyan", expand=False))
@@ -634,9 +844,9 @@ class OverlayToolApp:
 
             mounted = self.state == STATE_MOUNTED
             if mounted:
-                choices = ["U", "C", "V", "N", "L", "B", "H", "0"]
+                choices = ["U", "C", "R", "V", "N", "L", "B", "H", "0"]
             else:
-                choices = ["M", "V", "N", "L", "B", "H", "0"]
+                choices = ["M", "R", "V", "N", "L", "B", "H", "0"]
             choice = Prompt.ask("选择操作", choices=choices, default="0").upper()
 
             if choice == "M":
@@ -645,6 +855,8 @@ class OverlayToolApp:
                 self.action_unmount()
             elif choice == "C":
                 self.action_validate()
+            elif choice == "R":
+                self.action_review_drift()
             elif choice == "V":
                 self.action_toggle_format()
             elif choice == "N":

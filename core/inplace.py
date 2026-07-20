@@ -34,6 +34,7 @@ import shutil
 import sys
 from typing import Callable, Dict, List, Optional
 
+from . import baseline as baseline_mod
 from . import config as config_mod
 from . import def_table
 from . import diff
@@ -334,7 +335,10 @@ def mount(
     warnings: List[str] = []
 
     if is_mounted(cfg):
-        raise MountError("当前已处于挂载状态。请先卸载或删除 .maaowm/snapshot.json")
+        raise MountError("当前已处于挂载状态。请先卸载或删除 .state/snapshot.json")
+
+    # 落地 maaowm/ 脚手架 (建 .state/ + 写 .gitignore, 幂等)
+    config_mod.ensure_maaowm_scaffold(cfg)
 
     # 初始化 oracle (DLL 加载)
     cb("初始化 MaaFW oracle...")
@@ -435,6 +439,35 @@ def mount(
     if drift_warnings:
         cb(f"  ⚠ 检测到 {len(drift_warnings)} 处 type 漂移 (mod 覆盖了 base 的 type)")
         warnings.extend(drift_warnings)
+
+    # base' 基线漂移检测 (V3.7.9): base 自基线以来变没变 → 仅一行摘要, 详情归 [R]
+    # 复用已算好的 canonical_base / canonical_merged, 不重复 canonicalize
+    cb("检测 base 基线漂移 (base')...")
+    try:
+        slug, _branch, _reason = baseline_mod.effective_slug(cfg)
+        if baseline_mod.has_baseline(cfg, slug):
+            report = baseline_mod.detect_drift(
+                cfg, slug, mounted=False,
+                cano_now=canonical_base, cano_merged=canonical_merged,
+            )
+            if report.has_drift():
+                nfiles = sum(1 for f in report.files if f.nodes)
+                nnodes = sum(len(f.nodes) for f in report.files)
+                warnings.append(
+                    f"base 已偏离基线 base': {nfiles} 文件 / {nnodes} 节点漂移 "
+                    f"({report.total_review()} 需 review) —— 按 [R] 查看详情并处理"
+                )
+                cb(f"  ⚠ base 漂移: {nnodes} 节点 ({report.total_review()} 需 review)")
+            else:
+                cb("  base 与基线一致")
+        else:
+            warnings.append(
+                "尚未建立 base 基线 (base') —— 按 [R] 建立后即可检测 base 漂移"
+            )
+            cb("  尚未建立基线, 跳过")
+    except Exception as e:
+        warnings.append(f"base 基线检测跳过 (异常): {e}")
+        cb(f"  基线检测异常, 跳过: {e}")
 
     # 建 origin 索引 — 注意此时 mod 还是原状 (清空前)
     cb("建立 origin 索引...")

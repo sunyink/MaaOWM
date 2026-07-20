@@ -5,10 +5,16 @@ overlay_config.json 字段:
   target          : 必填, mod 包目录 (相对配置文件位置, 或绝对路径)
   base_layers     : 必填, base 包目录列表 (按顺序加载, 后者覆盖前者)
   maa_pkg_dir     : 选填, 显式 site-packages/maa 目录 (覆盖自动检测)
-  
+  maaowm_dir      : 选填, 显式 maaowm/ 目录 (覆盖自动定位的项目根/maaowm)
+
 路径规则:
   - 支持绝对路径和相对路径 (相对配置文件位置)
   - 支持 ../ 向上导航
+
+owm 文件布局 (统一到被管理项目根 maaowm/):
+  maaowm/.state/    本地状态 (快照/备份/日志), 自动 gitignore
+  maaowm/baseline/  base' 基线 (进 git 共享), 见 core/baseline.py
+  项目根定位: 显式 maaowm_dir > git toplevel(target) > target 向上找 assets
 """
 
 from __future__ import annotations
@@ -29,16 +35,55 @@ class OverlayConfig:
     base_layer_paths_resolved: List[pathlib.Path]  # base 目录列表 (绝对)
     maa_pkg_dir: Optional[pathlib.Path]          # 显式 maa 包目录 (绝对)
     output_format: str = "v2"                    # "v2" (默认) 或 "v1"
-    compact_node_refs: bool = True               # next/on_error 紧凑写法 ([JumpBack]name)
     compact_node_refs: bool = True               # next/on_error 紧凑写法 (默认 True)
+    maaowm_dir_explicit: Optional[pathlib.Path] = None  # 配置显式 maaowm_dir (绝对)
+    _maaowm_root_cache: Optional[pathlib.Path] = dataclasses.field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
     def base_layer_paths(self) -> List[pathlib.Path]:
         return self.base_layer_paths_resolved
 
+    def _resolve_project_root(self) -> pathlib.Path:
+        """定位被管理项目根: git toplevel(target) > target 向上找含 assets 的目录 >
+        target.parent (兜底)。"""
+        # 1. git toplevel (baseline 已依赖 git, 这是最稳的)
+        try:
+            from . import gitinfo
+            top = gitinfo.git_toplevel(self.target_path)
+            if top is not None:
+                return top
+        except Exception:
+            pass
+        # 2. 向上找名为 assets 的祖先, 取其父
+        for anc in self.target_path.parents:
+            if anc.name == "assets":
+                return anc.parent
+        # 3. 兜底
+        return self.target_path.parent
+
+    @property
+    def maaowm_root(self) -> pathlib.Path:
+        """被管理项目根下的统一 maaowm/ 目录 (显式 maaowm_dir 优先)。"""
+        if self.maaowm_dir_explicit is not None:
+            return self.maaowm_dir_explicit
+        if self._maaowm_root_cache is None:
+            self._maaowm_root_cache = self._resolve_project_root() / "maaowm"
+        return self._maaowm_root_cache
+
     @property
     def owm_dir(self) -> pathlib.Path:
-        """目标 mod 包同级的 .maaowm/ 目录, 存快照、备份、日志。"""
-        return self.target_path.parent / ".maaowm"
+        """本地状态目录 maaowm/.state/, 存快照、备份、日志 (整目录 gitignore)。"""
+        return self.maaowm_root / ".state"
+
+    @property
+    def baseline_root(self) -> pathlib.Path:
+        """base' 基线根 maaowm/baseline/ (进 git 共享)。"""
+        return self.maaowm_root / "baseline"
+
+    def baseline_dir(self, slug: str) -> pathlib.Path:
+        """某分支 slug 的 baseline 目录 maaowm/baseline/<slug>/。"""
+        return self.baseline_root / slug
 
     @property
     def workspace_dir(self) -> pathlib.Path:
@@ -140,6 +185,12 @@ def load_config(config_path: pathlib.Path) -> OverlayConfig:
             )
         compact_node_refs = cr
 
+    maaowm_dir_explicit: Optional[pathlib.Path] = None
+    if "maaowm_dir" in raw and raw["maaowm_dir"]:
+        if not isinstance(raw["maaowm_dir"], str):
+            raise ConfigError("maaowm_dir 必须是字符串")
+        maaowm_dir_explicit = _resolve_path(raw["maaowm_dir"], config_root)
+
     return OverlayConfig(
         config_path=config_path,
         config_root=config_root,
@@ -148,7 +199,25 @@ def load_config(config_path: pathlib.Path) -> OverlayConfig:
         maa_pkg_dir=maa_pkg_dir,
         output_format=output_format,
         compact_node_refs=compact_node_refs,
+        maaowm_dir_explicit=maaowm_dir_explicit,
     )
+
+
+def ensure_maaowm_scaffold(cfg: OverlayConfig) -> None:
+    """首次建 maaowm/ 时落地脚手架: 建 .state/ 并自动写 maaowm/.gitignore (排 .state/)。
+
+    幂等: 已存在则只补缺失项, 不覆盖。.gitignore 让本地状态默认不进 git,
+    无需人手改根 .gitignore。
+    """
+    root = cfg.maaowm_root
+    root.mkdir(parents=True, exist_ok=True)
+    cfg.owm_dir.mkdir(parents=True, exist_ok=True)
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(
+            "# MaaOWM 本地状态 (快照/备份/日志), 不进版本库\n.state/\n",
+            encoding="utf-8",
+        )
 
 
 def set_output_format_in_config(
