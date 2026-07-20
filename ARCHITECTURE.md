@@ -101,7 +101,7 @@ image / model 文件 MaaOWM 不碰，挂载/卸载时原样保留（passthrough�
 10. 清空 mod 的 pipeline 目录
 11. 写文件流水线:
       canonical_merged
-        → def 剥离 (按 def 表, 不带 base 对比 — 工作区独立加载靠 def)
+        → def 剥离 (按 def 表 + 双重判定, 传 canonical_base — 工作区是 base 的 overlay, 见 5.2)
         → V1/V2 转译 (按 output_format)
         → next/on_error 紧凑写法 (按 compact_node_refs)
         → wait_freezes 紧凑写法
@@ -258,7 +258,9 @@ mount / unmount 主流程编排。把上述所有模块串成 [第 3 节](#3-数
 
 两条都成立，才说明"这个字段在 mod 里写不写都一样"，可以剥。
 
-实现上，`strip_mod_with_def()` 卸载端接收 `canonical_base` 参数。挂载端不传——因为挂载写的是工作区，工作区独立加载，缺失字段用框架默认值补齐，base 是什么不影响。
+实现上，`strip_mod_with_def()` 卸载端与挂载端都接收 `canonical_base` 参数。
+
+> **勘误（前期误判，V3.7.10 修正）**：早期挂载端**不传** base，理由是"挂载写的是工作区，工作区独立加载，缺失字段用框架默认值补齐，base 是什么不影响"。这个前提对 **overlay 型资源是错的**——`interface.json` 里 PC = `["./resource/base", "./resource/pc"]` 两层，运行时 base+工作区做**字段级合并**，不是独立加载。若某字段 base 非默认、而 mod 把它覆盖成恰好等于框架默认值（实例 `Arbitrage_Card5#_Goin`：base `threshold` 0.95、mod 0.7＝TemplateMatch 默认），裸剥会把它从工作区删掉，挂载态运行时 base 的 0.95 反而透过合并盖回来，mod 精调的 0.7 被静默吞掉。故挂载端也必须双重判定——仅当 base 同字段也 ==默认才剥。这是本节双重判定在挂载端的镜像。（注：`verify_workspace_minimal*.py` 只证了"工作区独立加载"的 round-trip 闭合，覆盖不到叠加语义，故当初漏掉了这个坑。）
 
 **MOD_ONLY 的特例**（V0.7.5 修复）：如果一个 task 在 base 中根本不存在（用户新建的），双重判定的"base 对应字段"取不到值。此时应退化为朴素逻辑——base 没这个 task，等价于 base 全用默认值，按默认值剥即可。否则会因为"base 字段全是 None，永远不等于默认值"导致整个新建 task 一个字段都剥不掉。
 
@@ -361,6 +363,16 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 
 **关联护栏**（反向场景）：上面是「base 改 type、工作区跟随」。反过来，base 改了 type 但 **mod 仍 override 着旧 type** 时，overlay 语义是 mod 覆盖 base，合并后 type = mod 的旧 type，**静默盖住 base 的新逻辑**，而工作区只显示 mod 赢后的形态，开发者无从察觉 base 已变。`inplace.detect_type_drift()` 在挂载时对比 `canonical_merged` 与 `canonical_base` 的 reco/action type，发现不一致即发警告（机制类比 DELETED），补上这块信息缺失。
 
+### 7.7 挂载端裸剥离吞掉 mod override（双重判定的挂载端镜像）
+
+**现象**：base 某字段是非默认值、mod 把它 override 成"恰好等于框架默认值"（实例 `Arbitrage_Card5#_Goin`：base `threshold` 0.95、mod 0.7＝TemplateMatch 默认 `[0.7]`）。挂载后工作区里该字段**消失**；挂载态真跑时该节点阈值变回 base 的 0.95，mod 精调的 0.7 被静默吞掉。
+
+**根因**：挂载端 def 剥离**没传 `canonical_base`**（裸剥离），只要「值 == 默认」就删。早期设计（§3.1 step 11、[5.2](#52-双重判定剥离)）给挂载端此豁免，理由是"工作区独立加载，缺失字段用框架默认值补齐"。但这个前提对 **overlay 型资源是错的**——`interface.json` 里 PC = `["./resource/base", "./resource/pc"]` 两层，运行时 base+工作区做**字段级合并**（`canonicalize_overlay` = 同一 Resource 多次 `post_pipeline`），不是独立加载。字段被剥后工作区缺失，合并时 base 的非默认值反而透过来盖回。与 §7.3 同构，只是发生在挂载端。
+
+**为何一直没被发现**：`verify_workspace_minimal*.py` 的 round-trip 只测「工作区**独立** canonicalize 后是否闭合」，从没测 base+工作区叠加加载——验证方法本身也踩进了同一个"独立加载"前提。且 mount→unmount 一圈数据不丢（卸载走独立 canonicalize，缺失字段退默认 0.7，对 base 0.95 diff 判 MODIFIED，mod 重写回 0.7），掩盖了挂载态运行时的错。
+
+**对策**：挂载端也传 `canonical_base`，与卸载端一致做双重判定——仅当「值 == 默认 **且** base 同字段也 == 默认」才剥。base 非默认（0.95）时 threshold 保留在工作区，overlay 合并得 0.7。`strip_mod_with_def()` 内部已含 MOD_ONLY（[7.4](#74-mod_only-task-剥不掉-def-字段)）/ type 漂移（§7.6）的朴素退化，挂载端复用同一套。严格更安全：只会保留更多字段，绝不多剥。
+
 ### 其他较小的修复
 
 - 空 mod 目录导致 oracle 加载失败 → 检测空 mod 跳过加载
@@ -401,6 +413,10 @@ V3.7.9 base 基线漂移检测 (base') 落地 — 见 DESIGN-base-baseline.md
         TUI [R] 只读漂移面板 (文件列表→PR diff 详情→按文件复位)。
         owm 文件统一到项目根 maaowm/ (.state/ 本地 + baseline/ 共享),
         owm_dir 重指向 maaowm/.state/ (不做旧 .maaowm 自动迁移)。
+V3.7.10 挂载端双重判定 — 修挂载态 overlay 吞 mod override (见 7.7)
+        挂载端 def 剥离改传 canonical_base, 与卸载端对齐双重判定。base 非
+        默认、mod 覆盖成默认值的字段不再被裸剥, overlay 合并不再让 base 值
+        盖回。OWM_README_TEXT 文案同步纠正"独立加载"表述。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。
@@ -463,4 +479,4 @@ V3 的核心不是某个算法，是**承认自己不是权威，把权威让给
 
 ---
 
-*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.9。*
+*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.10。*

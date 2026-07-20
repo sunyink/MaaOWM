@@ -97,7 +97,8 @@ OWM_README_TEXT = """\
 
 此目录由 MaaOWM 挂载生成。每个 task 已展开为 base+mod 合并后的 canonical
 形态, 并按"省略默认值"原则做了精简:
-  - 字段值等于框架默认值的, 不写出 (省屏占, 接近 base 简洁形态)
+  - 字段被省略, 仅当「值==框架默认 且 base 同字段也==默认」(双重判定)。省略的
+    字段运行时 base⊕工作区 overlay 合并后仍是默认值, 不串味 (省屏占)。
   - next/on_error 用紧凑字符串写法 (默认; 可在配置切换)
   - 输出格式默认 V2 (嵌套); 可切换 V1 (拍平), 看个人偏好
   - 保留 base/mod 中的注释字段 (doc, desc 等非 MaaFW 字段, V0.7.0+)
@@ -110,12 +111,13 @@ OWM_README_TEXT = """\
   ✓ 新建 task
   ✓ 修改/新增 doc/desc 等注释字段 (会被持久化到 mod)
 
-  ✗ 不要从 task 里删除字段, 妄图"恢复"成 base 的值
-     原因: 工作区独立加载时, 缺失字段会退到框架默认值 (不是 base 的值)。
-           你的"删除"实际效果是"改成框架默认", 与你的预期不符。
-     做法: 如需还原 base 的某字段, 请直接把值改成你期望的形态。
-     旁注: 你看到的工作区里没写的字段, 也不代表是 base 的值, 可能是
-          框架默认 — 加载时 parser 会自动还原。
+  ✗ 不要从 task 里删除字段, 妄图"恢复"成 base 或框架默认
+     原因: 运行时是 base⊕工作区 的字段级 overlay。删掉某字段后, base 同字段的
+           值会透过合并显出来 —— base 若是非默认值, 你拿到的是 base 的值, 不是
+           框架默认, 更不一定是你想要的。
+     做法: 如需某字段是特定值, 直接把它写成你期望的形态 (显式覆盖)。
+     旁注: 工作区里没写的字段, 是「base 与框架默认恰好一致」的那些 (双重判定
+          才会省略), 合并后仍是默认值, 不必手动补。
 
   ✗ 不要随意删除被引用的 task
      原因: next/on_error 引用不存在的 task 名时, MaaFW 会拒绝加载。
@@ -496,10 +498,23 @@ def mount(
     pipeline_to_write = canonical_merged
 
     # def 剥离 (V0.6.0): 让工作区接近 base 简洁形态
-    # round-trip 已实证闭合 (verify_workspace_minimal.py 通过)
-    cb("  def 剥离 (按 type 白名单, 减少冗余字段)...")
+    # round-trip 已实证闭合 —— 但 verify_workspace_minimal*.py 只证了"工作区独立
+    # 加载"的闭合 (strip 后 canonicalize(工作区) == canonical). 真实运行时 PC 是
+    # [base, pc] 两层 overlay (interface.json), 独立加载的证明覆盖不到叠加语义.
+    #
+    # ★ 双重判定 (对齐卸载端, 传 canonical_base):
+    #   早期认为挂载端可裸剥 (缺失字段独立加载靠 def 回填), 该前提对 overlay 资源
+    #   是错的. 若某字段 base 非默认、mod 把它覆盖成"恰好等于默认值" (实例
+    #   Arbitrage_Card5#_Goin: base threshold 0.95, mod 0.7 = TemplateMatch 默认),
+    #   裸剥会把它从工作区删掉; 挂载态运行时 base+工作区 字段级合并, base 的 0.95
+    #   反而透过合并盖回来, mod 精调的 0.7 被静默吞掉. 传 canonical_base 后仅当
+    #   base 同字段也 == 默认才剥, 修掉此坑 (§5.2/§7.3 双重判定在挂载端的镜像;
+    #   strip 内部已含 MOD_ONLY / type 漂移的朴素退化).
+    cb("  def 剥离 (按 type 白名单 + 双重判定, 减少冗余字段)...")
     stripped = def_table.strip_mod_with_def(
-        pipeline_to_write, def_tables, canonical_w=canonical_merged,
+        pipeline_to_write, def_tables,
+        canonical_w=canonical_merged,
+        canonical_base=canonical_base,
     )
     cb(f"  剥离 {stripped} 个 def 字段")
 
