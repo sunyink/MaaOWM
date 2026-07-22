@@ -161,41 +161,56 @@ class TaskExtras:
         return not self.top_extras and not self.sub_extras
 
 
+def _extras_map_to_jsonable(m: Dict[str, TaskExtras]) -> dict:
+    return {
+        k: {
+            "top_extras": v.top_extras,
+            "sub_extras": {str(idx): val for idx, val in v.sub_extras.items()},
+        }
+        for k, v in m.items()
+    }
+
+
+def _extras_map_from_jsonable(d: dict) -> Dict[str, TaskExtras]:
+    out = {}
+    for k, v in d.items():
+        out[k] = TaskExtras(
+            top_extras=v.get("top_extras", {}),
+            sub_extras={int(i): val for i, val in v.get("sub_extras", {}).items()},
+        )
+    return out
+
+
 @dataclasses.dataclass
 class ExtrasSnapshot:
     """挂载时收集的 extras 总集 + node_order 索引。
 
-    extras: { task_name: TaskExtras }
+    extras: { task_name: TaskExtras } — base+mod 按层合并后 (mod 优先)
     node_order: { 文件相对路径(POSIX): [task_name 列表, 按文件原序] }
                 文件归属和 .maaowm/origin.json 一致.
+    base_extras (V0.7.11): 仅 base 层的 extras (mod 合并前快照)。
+                卸载注入时用于层归属过滤 — 工作区 extras 值与 base 相同
+                的字段归 base, 不写进 mod (见 ARCHITECTURE 7.8)。
     """
     extras: Dict[str, TaskExtras] = dataclasses.field(default_factory=dict)
     node_order: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
+    base_extras: Dict[str, TaskExtras] = dataclasses.field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps({
-            "extras": {
-                k: {
-                    "top_extras": v.top_extras,
-                    "sub_extras": {str(idx): val for idx, val in v.sub_extras.items()},
-                }
-                for k, v in self.extras.items()
-            },
+            "extras": _extras_map_to_jsonable(self.extras),
             "node_order": self.node_order,
+            "base_extras": _extras_map_to_jsonable(self.base_extras),
         }, ensure_ascii=False, indent=2)
 
     @classmethod
     def from_json(cls, text: str) -> "ExtrasSnapshot":
         d = json.loads(text)
-        extras = {}
-        for k, v in d.get("extras", {}).items():
-            extras[k] = TaskExtras(
-                top_extras=v.get("top_extras", {}),
-                sub_extras={int(i): val for i, val in v.get("sub_extras", {}).items()},
-            )
         return cls(
-            extras=extras,
+            extras=_extras_map_from_jsonable(d.get("extras", {})),
             node_order=d.get("node_order", {}),
+            # 旧版 extras.json 无此键 → {} , 过滤优雅退化为旧行为
+            base_extras=_extras_map_from_jsonable(d.get("base_extras", {})),
         )
 
 
@@ -330,6 +345,11 @@ def collect_layered_extras(
                 final_order[rel] = list(names)
                 seen_in_base.update(names)
 
+    # ★ V0.7.11: 记录仅 base 层的 extras (mod 合并前快照)。
+    # mod 合并是整对象替换 (final_extras[task_name] = te), 不原地修改
+    # TaskExtras, 浅拷贝 dict 即可安全共享对象。
+    base_extras = dict(final_extras)
+
     # mod 层
     if mod_dir and mod_dir.exists():
         ex, order = collect_extras_from_dir(mod_dir, def_tables)
@@ -345,7 +365,8 @@ def collect_layered_extras(
             else:
                 final_order[rel] = list(names)
 
-    return ExtrasSnapshot(extras=final_extras, node_order=final_order)
+    return ExtrasSnapshot(extras=final_extras, node_order=final_order,
+                          base_extras=base_extras)
 
 
 # ============================================================
@@ -467,6 +488,58 @@ def diff_extras(
             continue
 
     return changed
+
+
+# ============================================================
+# 层归属过滤 (V0.7.11): 卸载注入前把 "属于 base 的 extras" 滤掉
+# ============================================================
+
+def subtract_base_extras(
+    ws_te: TaskExtras,
+    base_te: Optional[TaskExtras],
+) -> TaskExtras:
+    """返回 ws_te 中「不属于 base」的子集 (V0.7.11 层归属过滤)。
+
+    字段值与 base 同 task 同字段完全相等 → 归 base, 剔除
+    (即使 mod 作者曾显式抄写同值 desc 也会被清 — 与 minimal 哲学一致);
+    base 无该字段 / 值不同 → 保留 (用户新增或修改);
+    sub_extras 按下标对齐同样过滤;
+    base_te=None (base 无此 task 或旧 extras.json 无 base_extras) → 原样返回。
+    """
+    if base_te is None:
+        return ws_te
+    top = {k: v for k, v in ws_te.top_extras.items()
+           if k not in base_te.top_extras or base_te.top_extras[k] != v}
+    sub: Dict[int, Dict[str, Any]] = {}
+    for idx, fields in ws_te.sub_extras.items():
+        base_f = base_te.sub_extras.get(idx, {})
+        kept = {k: v for k, v in fields.items()
+                if k not in base_f or base_f[k] != v}
+        if kept:
+            sub[idx] = kept
+    return TaskExtras(top_extras=top, sub_extras=sub)
+
+
+def build_mod_extras_snapshot(
+    workspace: ExtrasSnapshot,
+    mount_time: Optional[ExtrasSnapshot],
+    allowed_tasks: Set[str],
+) -> ExtrasSnapshot:
+    """卸载注入前的过滤: 只保留 allowed_tasks (= minimal_to_write 成员) 中、
+    且减去 base 归属后非空的 extras。
+
+    mount_time=None (状态文件缺失) → 无 base 对照, 退化为只按 allowed 过滤
+    (与 0.7.9 行为一致)。
+    """
+    base_map = mount_time.base_extras if mount_time is not None else {}
+    out: Dict[str, TaskExtras] = {}
+    for name, te in workspace.extras.items():
+        if name not in allowed_tasks:
+            continue
+        fv = subtract_base_extras(te, base_map.get(name))
+        if not fv.is_empty():
+            out[name] = fv
+    return ExtrasSnapshot(extras=out, node_order=workspace.node_order)
 
 
 # ============================================================
@@ -696,6 +769,109 @@ def _self_test() -> bool:
     print(f"  ✓ case 14: 新建 task 含 doc → 进 mod"
           if ok else f"  ✗ case 14: 实际 {changed}")
     all_ok = all_ok and ok
+
+    # ─── case 15: subtract_base_extras — 同值剔除 / 不同保留 (V0.7.11) ───
+    ws_te = TaskExtras(top_extras={"desc": "base 的描述", "doc": "用户改过的"})
+    base_te = TaskExtras(top_extras={"desc": "base 的描述", "doc": "base 原文"})
+    fv = subtract_base_extras(ws_te, base_te)
+    ok = fv.top_extras == {"doc": "用户改过的"}
+    print(f"  ✓ case 15: 层归属过滤 — 同值剔除/不同保留"
+          if ok else f"  ✗ case 15: 实际 {fv}")
+    all_ok = all_ok and ok
+
+    # ─── case 16: subtract — base 无该字段 (mod 新增 doc) → 保留 ───
+    ws_te = TaskExtras(top_extras={"doc": "mod 新增"})
+    base_te = TaskExtras(top_extras={"desc": "base 只有 desc"})
+    fv = subtract_base_extras(ws_te, base_te)
+    ok = fv.top_extras == {"doc": "mod 新增"}
+    print(f"  ✓ case 16: base 无该字段 → 保留"
+          if ok else f"  ✗ case 16: 实际 {fv}")
+    all_ok = all_ok and ok
+
+    # ─── case 17: subtract — base_te=None → 原样返回 (MOD_ONLY/旧文件退化) ───
+    ws_te = TaskExtras(top_extras={"desc": "任何值"})
+    fv = subtract_base_extras(ws_te, None)
+    ok = fv is ws_te
+    print(f"  ✓ case 17: base_te=None → 原样返回"
+          if ok else f"  ✗ case 17: 实际 {fv}")
+    all_ok = all_ok and ok
+
+    # ─── case 18: subtract — sub_extras 下标过滤 ───
+    ws_te = TaskExtras(sub_extras={
+        0: {"doc": "同值"},                       # 与 base 同 → 整个 idx 移除
+        1: {"doc": "改过", "v3_note": "同值"},    # 混合 → 只留 doc
+    })
+    base_te = TaskExtras(sub_extras={
+        0: {"doc": "同值"},
+        1: {"doc": "原值", "v3_note": "同值"},
+    })
+    fv = subtract_base_extras(ws_te, base_te)
+    ok = fv.sub_extras == {1: {"doc": "改过"}}
+    print(f"  ✓ case 18: sub_extras 下标过滤 (空 idx 移除)"
+          if ok else f"  ✗ case 18: 实际 {fv.sub_extras}")
+    all_ok = all_ok and ok
+
+    # ─── case 19: 序列化往返含 base_extras + 旧格式兼容 ───
+    snap_new = ExtrasSnapshot(
+        extras={"T": TaskExtras(top_extras={"doc": "x"})},
+        node_order={"a.json": ["T"]},
+        base_extras={"T": TaskExtras(top_extras={"doc": "base 值"})},
+    )
+    back = ExtrasSnapshot.from_json(snap_new.to_json())
+    ok1 = back.base_extras["T"].top_extras == {"doc": "base 值"}
+    # 旧格式 (无 base_extras 键) → {}
+    old_back = ExtrasSnapshot.from_json(
+        '{"extras": {}, "node_order": {}}'
+    )
+    ok2 = old_back.base_extras == {}
+    ok = ok1 and ok2
+    print(f"  ✓ case 19: base_extras 序列化往返 + 旧格式退化 {{}}"
+          if ok else f"  ✗ case 19: ok1={ok1} ok2={ok2}")
+    all_ok = all_ok and ok
+
+    # ─── case 20: build_mod_extras_snapshot — allowed 过滤 + 空 task 不出现 ───
+    ws_snap = ExtrasSnapshot(extras={
+        "InMod_Leak": TaskExtras(top_extras={"desc": "base 的"}),      # 全归 base → 不出现
+        "InMod_Real": TaskExtras(top_extras={"desc": "用户新写的"}),   # 保留
+        "NotInMod": TaskExtras(top_extras={"doc": "不在 minimal_mod"}),  # allowed 外 → 不出现
+    })
+    mt_snap = ExtrasSnapshot(base_extras={
+        "InMod_Leak": TaskExtras(top_extras={"desc": "base 的"}),
+        "InMod_Real": TaskExtras(top_extras={"desc": "base 原描述"}),
+    })
+    filtered = build_mod_extras_snapshot(
+        ws_snap, mt_snap, {"InMod_Leak", "InMod_Real"})
+    ok = (set(filtered.extras.keys()) == {"InMod_Real"}
+          and filtered.extras["InMod_Real"].top_extras == {"desc": "用户新写的"})
+    print(f"  ✓ case 20: build_mod_extras_snapshot 过滤"
+          if ok else f"  ✗ case 20: 实际 {list(filtered.extras.keys())}")
+    all_ok = all_ok and ok
+
+    # ─── case 21: collect_layered_extras 分层正确 (真实目录, 无 DLL) ───
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base_dir = pathlib.Path(td) / "base"
+        mod_dir2 = pathlib.Path(td) / "mod"
+        (base_dir).mkdir()
+        (mod_dir2).mkdir()
+        (base_dir / "p.json").write_text(json.dumps({
+            "T1": {"desc": "base 描述", "recognition": "OCR"},
+            "T2": {"doc": "base 文档"},
+        }, ensure_ascii=False), encoding="utf-8")
+        (mod_dir2 / "p.json").write_text(json.dumps({
+            "T1": {"desc": "mod 覆盖描述"},
+            "T3": {"desc": "mod 新增"},
+        }, ensure_ascii=False), encoding="utf-8")
+        snap_l = collect_layered_extras([base_dir], mod_dir2, fake_def_tables)
+        ok = (snap_l.base_extras.get("T1") is not None
+              and snap_l.base_extras["T1"].top_extras == {"desc": "base 描述"}
+              and snap_l.extras["T1"].top_extras == {"desc": "mod 覆盖描述"}
+              and "T3" not in snap_l.base_extras
+              and snap_l.extras["T3"].top_extras == {"desc": "mod 新增"}
+              and snap_l.base_extras["T2"].top_extras == {"doc": "base 文档"})
+        print(f"  ✓ case 21: collect_layered_extras 分层 (base_extras/extras)"
+              if ok else f"  ✗ case 21: base={snap_l.base_extras} merged={snap_l.extras}")
+        all_ok = all_ok and ok
 
     return all_ok
 

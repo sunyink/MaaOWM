@@ -32,7 +32,7 @@ import json
 import pathlib
 import shutil
 import sys
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from . import baseline as baseline_mod
 from . import config as config_mod
@@ -662,16 +662,21 @@ def unmount(
 
     # extras 变更检测 (V0.7.2): 用户单独改 doc/desc 也要写入 mod
     # 即使 oracle diff 看 IDENTICAL, 只要 extras 变了就强制入 mod
+    # V0.7.11: mount_time_extras / forced_extras_tasks 提升作用域,
+    # 供后面的层归属过滤与空 task 剔除使用
+    mount_time_extras: Optional[extras_mod.ExtrasSnapshot] = None
+    forced_extras_tasks: Set[str] = set()
     extras_path = cfg.owm_dir / EXTRAS_FILENAME
     if extras_path.exists() and workspace_extras is not None:
         try:
-            mount_extras = extras_mod.ExtrasSnapshot.from_json(
+            mount_time_extras = extras_mod.ExtrasSnapshot.from_json(
                 extras_path.read_text(encoding="utf-8")
             )
-            extras_changed = extras_mod.diff_extras(workspace_extras, mount_extras)
+            extras_changed = extras_mod.diff_extras(workspace_extras, mount_time_extras)
             # 把 extras 变更但不在 minimal_mod 的 task 强制加进去
             forced = 0
             for name in extras_changed:
+                forced_extras_tasks.add(name)
                 if name not in diff_result.minimal_mod:
                     diff_result.minimal_mod[name] = {}
                     forced += 1
@@ -742,18 +747,26 @@ def unmount(
     # 注入 workspace extras 到 minimal_mod (V0.7.0)
     # 仅对 minimal_mod 中存在的 task 注入 (即用户改过的 task)
     # IDENTICAL task 不写 mod, 自然也不写 extras (mod 保持简洁)
+    # V0.7.11: 按 base 层归属过滤 — 工作区 extras 值与挂载时 base 层相同
+    # 的字段归 base, 不写进 mod (修 base desc 泄漏, ARCHITECTURE 7.8)
     if workspace_extras is not None:
-        cb("  注入 workspace extras (用户改过的 task 的 doc/desc)...")
-        # 过滤: 只注入 minimal_mod 中存在的 task 的 extras
-        filtered_snap = extras_mod.ExtrasSnapshot(
-            extras={
-                k: v for k, v in workspace_extras.extras.items()
-                if k in minimal_to_write
-            },
-            node_order=workspace_extras.node_order,
+        cb("  注入 workspace extras (按 base 层归属过滤)...")
+        filtered_snap = extras_mod.build_mod_extras_snapshot(
+            workspace_extras, mount_time_extras, set(minimal_to_write.keys()),
         )
         injected = extras_mod.inject_extras_into_pipeline(minimal_to_write, filtered_snap)
         cb(f"  注入 {injected} 个 extras 字段")
+
+        # 边缘 (V0.7.11): 仅因 extras 变更被强制入 mod、层归属过滤后又
+        # 无任何 extras 的 task (例: 用户把 desc 改回 base 值 = 撤回
+        # override) → 从 mod 剔除, 避免落盘空 task {}
+        dropped = [n for n in forced_extras_tasks
+                   if isinstance(minimal_to_write.get(n), dict)
+                   and not minimal_to_write[n]]
+        for n in dropped:
+            del minimal_to_write[n]
+        if dropped:
+            cb(f"  剔除 {len(dropped)} 个过滤后为空的 task")
 
     grouped = routing.group_by_target_file(minimal_to_write, index)
 

@@ -14,7 +14,7 @@ v2 改进 — 模拟"理想全剥光"形态:
   recognition/action.param 内字段按 type 剥
   wait_freezes 内字段按其 def 剥
   attach/anchor 嵌套字段剥
-  And/Or 的 sub-recognition 递归剥 (sub_name 等于 type 字符串时省略)
+  And/Or 的 sub-recognition 递归剥 (sub_name 永远保留, V0.7.11 起)
   And 的 box_index == 0 删
 
 写入临时目录, oracle 重新加载, 看 canonical 是否仍闭合.
@@ -74,7 +74,7 @@ def strip_sub_recognition(sub_node: Any, def_tables: def_table.DefTables) -> Any
         剥离规则:
           1. 按 recognition.type 剥 recognition.param 内 def 字段
           2. recognition.param 全空 → 删 param
-          3. sub_name == recognition.type → 删 sub_name (parser 会自动回填)
+          3. sub_name 永远保留 (V0.7.11 起, 与 def_table._strip_sub_recognition 对齐)
     """
     if not isinstance(sub_node, dict):
         return sub_node
@@ -88,12 +88,6 @@ def strip_sub_recognition(sub_node: Any, def_tables: def_table.DefTables) -> Any
                 _strip_dict_by_def(param, def_tables.reco_param[r_type])
                 if not param:
                     del reco["param"]
-
-    # sub_name == reco.type → 删 (parser 会自动填回 type 名作为 sub_name)
-    if isinstance(reco, dict):
-        r_type = reco.get("type")
-        if r_type and sub_node.get("sub_name") == r_type:
-            del sub_node["sub_name"]
 
     return sub_node
 

@@ -29,6 +29,19 @@ DEFAULT_RECO_TYPE = "DirectHit"
 DEFAULT_ACTION_TYPE = "DoNothing"
 
 
+def _unwrap_single_target_array(v: Any) -> Any:
+    """★ V0.7.11: 解包 dumper 的单元素目标数组包裹。
+
+    当前 MaaFW (5.10.0b2) dumper 把 Swipe 的 end 规范成目标数组
+    [[x,y,w,h]] (begin 仍是单目标 [x,y,w,h]) — V1 输出端拍回
+    开发者手写的平坦形态。真·多段 (len>1) / 已平坦 → 原样。
+    解包后再次 canonicalize 会被 dumper 重新包裹, diff 恒在
+    canonical 层进行, 不产生幻影 diff。"""
+    if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
+        return v[0]
+    return v
+
+
 def _sub_v2_to_v1(sub: Any) -> Any:
     """把 And/Or 内的 sub-node V1 化拍平。
 
@@ -123,6 +136,18 @@ def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
             if a_type:
                 out["action"] = a_type
             for pk, pv in a_param.items():
+                # ★ V0.7.11: V1 输出端解包 dumper 的单元素目标数组包裹。
+                # a_type is None = minimal mod 未写 type (type 沿用 base) 的形态;
+                # action.param 层 "end" 仅 Swipe 拥有 / "swipes" 仅 MultiSwipe
+                # 拥有 (探针类型表核实), reco param / task 顶层无同名字段。
+                if pk == "end" and a_type in ("Swipe", None):
+                    pv = _unwrap_single_target_array(pv)
+                elif pk == "swipes" and a_type in ("MultiSwipe", None) and isinstance(pv, list):
+                    pv = [
+                        {**s, "end": _unwrap_single_target_array(s["end"])}
+                        if isinstance(s, dict) and "end" in s else s
+                        for s in pv
+                    ]
                 out[pk] = pv
     elif isinstance(act, str):
         out["action"] = act
@@ -483,6 +508,123 @@ def _self_test() -> bool:
                         "upper": [[200]],
                     },
                 ],
+            }
+        },
+    ))
+
+    # case 12: ★ V0.7.11 Swipe end 单元素目标数组解包
+    cases.append((
+        "Swipe end [[x,y,w,h]] 解包, begin 不动",
+        {
+            "TaskSw": {
+                "action": {
+                    "type": "Swipe",
+                    "param": {
+                        "begin": [150, 300, 1, 1],
+                        "end": [[150, 700, 1, 1]],
+                        "duration": 600,
+                    },
+                },
+            }
+        },
+        {
+            "TaskSw": {
+                "action": "Swipe",
+                "begin": [150, 300, 1, 1],
+                "end": [150, 700, 1, 1],
+                "duration": 600,
+            }
+        },
+    ))
+
+    # case 13: 真·多段 end (len>1) 原样保留
+    cases.append((
+        "Swipe end 多段 (len>1) 不解包",
+        {
+            "TaskSw2": {
+                "action": {
+                    "type": "Swipe",
+                    "param": {
+                        "begin": [117, 640],
+                        "end": [[117, 640, 1, 1], [1200, 500, 1, 1]],
+                    },
+                },
+            }
+        },
+        {
+            "TaskSw2": {
+                "action": "Swipe",
+                "begin": [117, 640],
+                "end": [[117, 640, 1, 1], [1200, 500, 1, 1]],
+            }
+        },
+    ))
+
+    # case 14: minimal mod 形态 (action 无 type, type 沿用 base) 也解包
+    cases.append((
+        "minimal mod 无 type 的 end 解包",
+        {
+            "TaskSw3": {
+                "action": {
+                    "param": {
+                        "end": [[820, 90, 1, 1]],
+                    },
+                },
+            }
+        },
+        {
+            "TaskSw3": {
+                "end": [820, 90, 1, 1],
+            }
+        },
+    ))
+
+    # case 15: MultiSwipe swipes[i].end 解包, 兄弟字段不动
+    cases.append((
+        "MultiSwipe swipes[i].end 解包",
+        {
+            "TaskMs": {
+                "action": {
+                    "type": "MultiSwipe",
+                    "param": {
+                        "swipes": [
+                            {"starting": 0, "begin": [100, 200], "end": [[300, 400, 1, 1]]},
+                            {"starting": 50, "begin": [500, 600], "end": [700, 800]},
+                        ],
+                    },
+                },
+            }
+        },
+        {
+            "TaskMs": {
+                "action": "MultiSwipe",
+                "swipes": [
+                    {"starting": 0, "begin": [100, 200], "end": [300, 400, 1, 1]},
+                    {"starting": 50, "begin": [500, 600], "end": [700, 800]},
+                ],
+            }
+        },
+    ))
+
+    # case 16: end 已平坦 → 透传 (幂等)
+    cases.append((
+        "Swipe end 已平坦透传",
+        {
+            "TaskSw4": {
+                "action": {
+                    "type": "Swipe",
+                    "param": {
+                        "begin": [1, 2],
+                        "end": [3, 4, 1, 1],
+                    },
+                },
+            }
+        },
+        {
+            "TaskSw4": {
+                "action": "Swipe",
+                "begin": [1, 2],
+                "end": [3, 4, 1, 1],
             }
         },
     ))

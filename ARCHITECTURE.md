@@ -278,13 +278,13 @@ MODIFIED task 里，`recognition` / `action` 等是嵌套 dict。朴素的"字�
 
 这样设计的好处：MaaFramework 升级新增字段时，动态探针会自动捕获，不会误把新字段当 extras。硬编码部分只是兜底（探针失败 type、V1 独有形态）。
 
-extras 收集对 base 多层 + mod 做覆盖式合并（mod 优先），sub-node 内的 extras 也递归处理。
+extras 收集对 base 多层 + mod 做覆盖式合并（mod 优先），sub-node 内的 extras 也递归处理。V0.7.11 起同时单独记录 mod 合并前的 base-only extras（`base_extras`），供卸载注入做层归属过滤（见 [7.8](#78-卸载注入把-base-层-desc-写进-modextras-层归属缺失)）。
 
 ### 5.5 节点顺序持久化
 
 oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原序）。直接写出去会打乱 base 的"叙事流"，git diff 也乱。
 
-挂载时记录 base 各文件中 task 的出现顺序到 `extras.json` 的 `node_order` 字段。写工作区/写 mod 时按这个顺序排：base 中出现过的 task 按 base 顺序，新建 task 按字母序排在文件末尾。
+挂载时记录 base 各文件中 task 的出现顺序到 `extras.json` 的 `node_order` 字段。写工作区/写 mod 时按这个顺序排：base 中出现过的 task 按 base 顺序；mod/工作区新建的 task 在收集阶段按其在 mod 文件中的原序追加到该文件顺序末尾（`collect_layered_extras`）；字母序仅是 order 中**未记录** task 的兜底（`reorder_pipeline_by_node_order` 的 leftovers）。
 
 注意：这里说的是**节点之间**的顺序（task 在文件里谁先谁后），不是节点内字段的顺序。字段顺序不管（编辑器有自己的排序）。
 
@@ -299,7 +299,7 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 ├── snapshot.json        挂载时的 canonical_base + 指纹 (diff 被减数)
 ├── origin.json          task → 原文件路径 索引 (写回时用)
 ├── def_tables.json      探针出的各 type 默认字段表
-├── extras.json          非 MaaFW 字段 (doc/desc) + 节点顺序
+├── extras.json          非 MaaFW 字段 (doc/desc) + 节点顺序 + base 层归属 (base_extras)
 └── <timestamp>/         备份目录 (时间戳命名)
     ├── mod/             挂载前的 mod 包原貌
     └── work/            卸载前的工作区原貌
@@ -373,12 +373,24 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 
 **对策**：挂载端也传 `canonical_base`，与卸载端一致做双重判定——仅当「值 == 默认 **且** base 同字段也 == 默认」才剥。base 非默认（0.95）时 threshold 保留在工作区，overlay 合并得 0.7。`strip_mod_with_def()` 内部已含 MOD_ONLY（[7.4](#74-mod_only-task-剥不掉-def-字段)）/ type 漂移（§7.6）的朴素退化，挂载端复用同一套。严格更安全：只会保留更多字段，绝不多剥。
 
+### 7.8 卸载注入把 base 层 desc 写进 mod（extras 层归属缺失）
+
+**现象**：base 某节点有 `desc`、mod 没有；挂载后工作区该节点带上 base 的 desc（这是设计意图——工作区是全字段视图）。但该节点若因任一字段差异进了 minimal_mod，卸载注入会把这份"其实来自 base"的 desc 一并写进 mod 文件——mod 被 base 内容污染（实例 `Arbitrage_Buy_Select_QE5`：PC 只覆盖了 roi，卸载后凭空多出 base 的 desc）。运行时无害（desc 是注释字段），但破坏 mod 最小性、制造 git diff 噪声；且下次挂载时这份拷贝会以 mod 层身份覆盖 base——若日后 base 的 desc 更新，mod 里的陈旧拷贝会永远盖住它。
+
+**根因**：卸载注入（inplace.unmount 的 extras 注入块）只按「task 在不在 minimal_mod 里」过滤，不辨字段的**层归属**。工作区 extras 是挂载时 base+mod 合并的产物，卸载时无从知道某个 desc 是 base 的还是 mod 的。
+
+**对策**（V0.7.11）：`extras.json` 增记 `base_extras`——挂载收集时在 mod 合并**之前**快照仅 base 层的 extras（`collect_layered_extras`）。卸载注入前经 `subtract_base_extras` 逐字段过滤：工作区值 == base 同字段值 → 归 base，不写 mod；不同或 base 无 → 保留（用户修改/新增）。sub-node extras 按下标同规则。附带边缘处理：仅因 extras 变更被强制入 mod、过滤后又变空 `{}` 的 task（用户把 desc 改回 base 值 = 撤回 override）从 mod 剔除。旧 `extras.json` 无 `base_extras` 键时优雅退化为旧行为（不崩不变形）。
+
+注意语义：mod 作者**显式抄写**的与 base 同值 desc 也会被清——与字段 diff 的 minimal 哲学一致，属有意为之。
+
 ### 其他较小的修复
 
 - 空 mod 目录导致 oracle 加载失败 → 检测空 mod 跳过加载
 - `routing.write_mod_files` 曾强制字母序排序，覆盖了 node_order → 去掉强制排序，信任上游
 - 单独修改 doc/desc 不触发 mod 写回 → `extras.diff_extras` 检测 extras 变化，强制相关 task 入 mod
 - 探针的 stderr 噪音 → 进程级缓存避免重复探针
+- MaaFW 5.10 dumper 把 Swipe `end` 规范成目标数组 `[[x,y,w,h]]`（begin 仍是单目标，不对称）→ V1 输出端 `task_v2_to_v1` 解包单元素目标数组（真·多段 len>1 不动；MultiSwipe 的 `swipes[i].end` 同规则）（V0.7.11）
+- `sub_name == recognition.type` 时被 def 剥离主动删除（依赖 parser 回填）→ 移除该规则，sub_name 永远保留——主动删除用户写下的内容违背最小侵入（V0.7.11）
 
 ---
 
@@ -417,6 +429,10 @@ V3.7.10 挂载端双重判定 — 修挂载态 overlay 吞 mod override (见 7.7
         挂载端 def 剥离改传 canonical_base, 与卸载端对齐双重判定。base 非
         默认、mod 覆盖成默认值的字段不再被裸剥, overlay 合并不再让 base 值
         盖回。OWM_README_TEXT 文案同步纠正"独立加载"表述。
+V3.7.11 extras 层归属 (base_extras) — 卸载注入按 base 归属过滤, 修 base
+        desc 泄漏进 mod (见 7.8); V1 输出解包单元素 Swipe/MultiSwipe end
+        (dumper 5.10 目标数组包裹拍回平坦形态); 移除 sub_name==type 主动
+        删除 (sub_name 永远保留)。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。
@@ -479,4 +495,4 @@ V3 的核心不是某个算法，是**承认自己不是权威，把权威让给
 
 ---
 
-*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.10。*
+*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.11。*

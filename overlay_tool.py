@@ -37,7 +37,7 @@ from core import inplace
 from core import preflight
 
 
-VERSION = "0.7.9"
+VERSION = "0.7.11"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"

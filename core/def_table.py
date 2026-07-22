@@ -380,7 +380,8 @@ def _strip_sub_recognition(
         剥离规则:
           1. 按 recognition.type 剥 recognition.param 内 def 字段
           2. recognition.param 全空 → 删 param
-          3. sub_name == recognition.type → 删 sub_name (parser 会自动回填)
+          3. sub_name 永远保留 (V0.7.11 起; 曾在 ==type 时删除, parser 虽会
+             回填但主动删除用户写下的内容违背最小侵入)
     
     base_sub_node (V0.7.3): canonical_base 中对应位置的 sub_node, 
       用于双重判定 (字段值 == def AND base 同字段也 == def 才剥)。
@@ -406,12 +407,6 @@ def _strip_sub_recognition(
                 if not param:
                     del reco["param"]
                     removed += 1
-
-        # sub_name == reco.type 时, parser 会自动用 type 名作为 sub_name
-        # (parse_sub_recognition 第 1980-1982 行)
-        if r_type and sub_node.get("sub_name") == r_type:
-            del sub_node["sub_name"]
-            removed += 1
 
     return removed
 
@@ -887,7 +882,7 @@ def _self_test() -> bool:
                         "box_index": 0,
                         "all_of": [
                             {
-                                "sub_name": "OCR",          # == reco.type → 删
+                                "sub_name": "OCR",          # == reco.type, 保留 (V0.7.11)
                                 "recognition": {
                                     "type": "OCR",
                                     "param": {
@@ -920,6 +915,7 @@ def _self_test() -> bool:
                     "param": {
                         "all_of": [
                             {
+                                "sub_name": "OCR",
                                 "recognition": {
                                     "type": "OCR",
                                     "param": {"expected": ["确定"]},
@@ -974,6 +970,7 @@ def _self_test() -> bool:
                     "param": {
                         "any_of": [
                             {
+                                "sub_name": "OCR",
                                 "recognition": {
                                     "type": "OCR",
                                     "param": {"expected": ["X"]},
@@ -1011,9 +1008,8 @@ def _self_test() -> bool:
                 },
             }
         },
-        # 期望: 整段保留 (NN 不在白名单, sub_name 也保留, 因为 sub_name == type 但 type 不在白名单 — 谨慎不动)
-        # 实际行为: sub_name == reco.type 仍然会触发删除 (无关白名单 — parser 总会回填)
-        # 所以 sub_name 会被删, 但 param 不动
+        # 期望: 整段保留 — NN 不在白名单, param 不剥;
+        # sub_name 自 V0.7.11 起永远保留 (不再有 ==type 删除规则)
         {
             "TaskL": {
                 "recognition": {
@@ -1021,6 +1017,7 @@ def _self_test() -> bool:
                     "param": {
                         "all_of": [
                             {
+                                "sub_name": "NeuralNetworkClassifier",
                                 "recognition": {
                                     "type": "NeuralNetworkClassifier",
                                     "param": {

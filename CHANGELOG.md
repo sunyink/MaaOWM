@@ -8,6 +8,80 @@ V3 是相对 V2 的彻底重写，不再尝试在外部重新实现 MaaFramework
 
 ---
 
+## [0.7.11] — extras 层归属 + V1 输出保真
+
+### Fixed
+- **卸载注入把 base 层 desc 写进 mod**（ARCHITECTURE 7.8, 实例
+  `Arbitrage_Buy_Select_QE5`）: 挂载把 base 的 desc 灌进工作区（设计意图,
+  全字段视图）, 卸载注入只按「task 在不在 minimal_mod」过滤, 不辨字段层
+  归属 → base 内容污染 mod。修复: `extras.json` 增记 `base_extras`
+  （mod 合并前的 base-only 快照）, 卸载注入前 `subtract_base_extras`
+  逐字段过滤——值 == base 同字段值归 base 不写 mod; 不同或 base 无则保留。
+  sub-node extras 按下标同规则。
+- 语义说明: mod 作者显式抄写的与 base 同值 desc 也会被清（minimal 哲学）;
+  用户把 desc 改回 base 值 = 撤回 override, 该 task 若因此变空 `{}` 会
+  从 mod 剔除（仅限因 extras 变更被强制入 mod 的 task）。
+
+### Changed
+- **V1 输出解包单元素目标数组**: MaaFW 5.10 dumper 把 Swipe `end` 规范成
+  `[[x,y,w,h]]`（begin 仍是平坦单目标, 不对称）。`task_v2_to_v1` 在 V1
+  输出端把 len==1 的目标数组拍回 `[x,y,w,h]`; 真·多段（len>1）不动;
+  MultiSwipe 的 `swipes[i].end` 同规则。canonical 层不动（oracle 哲学）,
+  再次 canonicalize 会被重新包裹, diff 恒在 canonical 层, 无幻影 diff。
+- **sub_name 永远保留**: 移除「sub_name == recognition.type 时主动删除」
+  规则（原依赖 parser 回填）。主动删除用户写下的内容违背最小侵入。
+  `verify_workspace_minimal_v2.py` 的同款规则同步移除。
+
+### Compatibility
+- 旧 `extras.json`（无 `base_extras` 键）→ 过滤优雅退化为 0.7.9 行为,
+  不崩不变形。挂载于旧版、卸载于新版时层归属过滤该轮不生效（fix2/fix3
+  正常生效, 无状态依赖）; 建议「卸载 → 升级 → 重挂载」。
+- 新 `extras.json` 被旧版读: 未知键被忽略, 可安全回滚。
+  snapshot.json / def_tables.json / origin.json 格式均不变。
+
+---
+
+## [0.7.10] — 挂载端双重判定
+
+### Fixed
+- 挂载端 def 剥离改传 `canonical_base`, 与卸载端对齐双重判定（ARCHITECTURE
+  7.7）。base 非默认、mod 覆盖成恰好等于框架默认值的字段不再被裸剥,
+  overlay 合并不再让 base 值盖回（实例 `Arbitrage_Card5#_Goin` threshold）。
+- OWM_README_TEXT 文案同步纠正"工作区独立加载"表述。
+
+---
+
+## [0.7.9] — base 基线漂移检测 (base')
+
+### Added
+- 持久、手动 ack、进 git 的 base 基线（`core/baseline.py`）, 按 git 分支
+  隔离（`core/gitinfo.py`）; 双 canonicalize 消版本假阳性; 挂载发一行摘要,
+  TUI [R] 只读漂移面板。详见 DESIGN-base-baseline.md。
+- owm 文件统一到项目根 `maaowm/`（`.state/` 本地 + `baseline/` 共享）,
+  owm_dir 重指向 `maaowm/.state/`。
+
+---
+
+## [0.7.8] — base type 漂移修复 + 挂载护栏
+
+### Fixed
+- base reco/action type 改变时双重判定失效, 新 type 的默认字段剥不掉
+  （与 0.7.5 MOD_ONLY 同构）→ type 不一致时退化朴素剥离（ARCHITECTURE 7.6）。
+
+### Added
+- `detect_type_drift` 挂载护栏: mod override 盖住 base 新 type 时发警告。
+
+---
+
+## [0.7.7] — custom param 原子保护
+
+### Fixed
+- `custom_action_param` / `custom_recognition_param` 注册进
+  `_ATOMIC_DICT_KEYS`, 阻止 deep_diff 递归剥离其与 base 相同的子字段。
+  MaaFW 对它们是整体替换而非 dict-merge, 剥离会导致运行时缺失必要参数。
+
+---
+
 ## [0.7.6] — 文档完善
 
 ### Changed
