@@ -1,5 +1,0 @@
-Traceback (most recent call last):
-  File "F:\Git BD2\MaaOWM\tests\test_integration.py", line 17, in <module>
-    from core.merger import merge_to_workspace
-ModuleNotFoundError: No module named 'core.merger'
-EXIT:1
