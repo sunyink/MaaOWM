@@ -37,7 +37,7 @@ from core import inplace
 from core import preflight
 
 
-VERSION = "0.7.11"
+VERSION = "0.7.13"
 
 STATE_UNMOUNTED = "未挂载"
 STATE_MOUNTED = "已挂载"
@@ -714,6 +714,8 @@ class OverlayToolApp:
                 "  • 工作区文件: recognition/action 字段拍平到 task 顶层\n"
                 "  • mod 产物:   同样拍平形态\n"
                 "  • 默认 type (DirectHit/DoNothing) 整段省略\n"
+                "    —— 仅当 base 同字段也是默认时; base 非默认时照写,\n"
+                "       否则省略会被 base 的 type 盖回 (V0.7.13)\n"
             )
         else:
             base_hint = (

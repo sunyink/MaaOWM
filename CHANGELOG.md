@@ -8,6 +8,104 @@ V3 是相对 V2 的彻底重写，不再尝试在外部重新实现 MaaFramework
 
 ---
 
+## [0.7.13] — 双重判定推进到 type 层
+
+### Fixed
+- **V1「默认 type 省略」吞掉"改回默认 type"的 override**（ARCHITECTURE 7.10,
+  实例 MFABD2 `Event_GoinEvent`）: base 是 `recognition: And` + `action: Click`
+  + `target: [1118,387]`, 在挂载态工作区把 `action` 改成 `DoNothing`（意图是
+  只识别不点, base 那个坐标已成盲点, 改由下游 `_OcrCk` 真点）。卸载后适配包里
+  该节点**没有 action**, 运行时 [base, pc] 合并沿用 base 的 `Click`, 盲点照点
+  不误。反复改反复丢 —— 每次挂载工作区都显示回 `Click`。
+  同一条路径上 `recognition` 从 `And`/`OCR` 改成 `DirectHit` 也会整段消失。
+- 根因是 `translator.task_v2_to_v1()` 的 V1 输出规则 3「type 是默认值且 param
+  为空 → 整段省略」。它依赖的等价关系「V1 省略 recognition/action ≡ 该字段取
+  框架默认值」只对**独立完整节点**成立; 本工具的两个产物（卸载的 mod delta、
+  挂载的挂载态工作区）都是 overlay 的一层, 层里省略的语义是"不覆盖"而非
+  "取默认值", base 的非默认 type 会透过字段级合并盖回。
+  与 7.3 / 7.6 / 7.7 同族的第四例: 双重判定做到了 **param 层**, 漏了 **type 层**
+  —— 且做判定的 `def_table` 与执行省略的 `translator` 分离, 后者手上没有 base。
+- **隐蔽变体**: mod 里原本手写着 `"action": "DoNothing"` 时, 一次 mount/unmount
+  空转（用户一个字没改）就能把它永久抹掉 —— 挂载省略进不了工作区, 卸载 diff
+  出来又被省略。
+- 修复: `task_v2_to_v1(base_task=)` / `pipeline_v2_to_v1(canonical_base=)` 接收
+  base 对照, 省略需同时满足「当前 type == 默认 且 base 同字段 type 也是默认
+  （或 base 无此 task / 无此字段）」。挂载卸载两端都传。
+
+### Changed
+- `def_table` 侧**未动**。丢信息的是 V1 输出这一步, 不是剥离 —— 剥掉
+  `DoNothing` 的空 `param` 本身不损语义, 剥完只剩 `{"type":"DoNothing"}` 正好
+  命中 translator 的省略规则。在剥离侧打补丁只会掩盖真正的边界。
+- `_sub_v2_to_v1()`（And/Or 内联 sub）**不需要** base 对照: 列表字段整段进 mod
+  （`deep_diff` 对 list 不递归）, 每个 sub 都是完整节点, 省略语义成立。
+
+### Verified
+- MaaFW 5.11.1 `canonicalize_overlay` 实测三种 mod 形态（base = `And` +
+  `Click[1118,387]`）: mod 省略 action → 合并得 `Click` + `target
+  [1118,387,1,1]`（bug 的运行时后果坐实）; V1 写 `"DoNothing"` → 合并得
+  `DoNothing` + `param {}`（修复产物有效）; V2 写 `{"type":"DoNothing"}` →
+  同上（"V2 不受影响"成立）。
+- 附带查明: reco/action **换 type 时 MaaFW 整体替换**, param 按新 type 重置,
+  不与 base 旧 type 的 param 做 dict-merge。故 mod 只写一个 type 名就够, 无需
+  连带清理 base 的参数字段。
+
+### Compatibility
+- 不传对照时退化为旧行为, 纯格式转换的直调不受影响; 16 个原有 translator
+  自检 case 全绿。
+- 状态文件格式全部不变（snapshot / def_tables / origin / extras）, 可安全回滚。
+- **存量适配包需人工回看**: 已经被吞掉的 `action` / `recognition` 在产物里不留
+  痕迹（表现为"这个节点没覆盖该字段"）, 工具无法反查区分"本来就没打算覆盖"和
+  "被吞了"。修复只保证此后不再发生。已知一例: MFABD2
+  `assets/resource/pc/pipeline/EventBattle.json` 的 `Event_GoinEvent` 缺
+  `"action": "DoNothing"`。
+
+---
+
+## [0.7.12] — 落点第三级：工作区新建节点写回原文件
+
+### Fixed
+- **工作区新建的节点被搬进 `__mod_extras__.json`**（ARCHITECTURE 7.9, 实例
+  MFABD2 `feat/EventBattle` 的 `Event_GoinEvent_OcrCk`）: 在挂载态工作区某个
+  json 里新建节点, 卸载后它不在原文件, 而在适配包新生成的
+  `__mod_extras__.json` 里, 原文件只剩一句 `next` 指向它。根因是
+  `decide_target_file()` 只查 `mod_origin` / `base_origin` 两张**挂载时快照**
+  表, 工作区新建的节点两张都命中不了 → 落进硬编码兜底文件名。
+- **粘死**（同一 bug 的第二层）: 兜底文件生成后就躺在适配包里, 下次挂载扫
+  mod 包建 `mod_origin` 时命中它, 而 `mod_origin` 优先级最高 —— 一旦落进去,
+  在工作区手动搬回会被下次卸载搬走, 在产物上手动搬回会被下次挂载搬走。
+- 修复: `decide_target_file()` 增加第三级 `workspace_origin`, 数据来自卸载时
+  `oracle.list_node_names_with_origin(工作区)` 现扫的 `{task: 文件相对路径}`。
+  纯 JSON 扫描、不依赖 def 表, 对 `canonical_w` 无条件全覆盖。
+
+### Removed
+- **`EXTRAS_FILENAME` 常量与兜底分支整体删除**。三级全 miss 改抛
+  `routing.RoutingError` —— 理论上不可达（挂载端 `canonical_merged ⊆ base ∪ mod`
+  前两级必然命中; 卸载端 `minimal_mod ⊆ canonical_w` 必被第三级覆盖）。
+  宁可炸掉也不再发明兜底文件: 上一个兜底文件就是这么来的。
+- **适配包目录内不再生成任何 owm 文件。** 资源包只装能被 MaaFramework 加载的
+  东西, owm 自己的记账一律留在 `maaowm/` 下。
+
+### Changed
+- `_clean_pipeline_dir()` 从"分组之前"移到"分组之后、落盘之前"（挂载/卸载
+  两端一致）。落点分组是写盘流水线上唯一会抛错的一步, 旧顺序抛错会留下一个
+  空的 pipeline 目录, 只剩备份可救; 现在异常都停在"目录原样未动"的状态。
+- 三级顺序是"旧归属优先于工作区现状": 在挂载态**跨文件搬动已有节点仍会被
+  撤销**, 有意保留 —— mod 的文件划分继续镜像 base。只有工作区新建的节点
+  （前两级必然 miss）才走第三级。
+
+### Compatibility
+- 不写迁移代码。修复后不再产生 `__mod_extras__.json`, 存量由使用者删一次即可
+  （删之前先把里面的节点搬回它们该在的文件）。**未删干净时该文件仍会被
+  `mod_origin` 命中而继续粘住**, 这是选择不做迁移的已知代价。
+- 状态文件格式全部不变（snapshot / def_tables / origin / extras）, 可安全
+  回滚。`OriginIndex` 序列化结构未动 —— `workspace_origin` 现扫现用, 不落盘。
+- 资源项目侧: 若曾在 `.gitignore` 里忽略 `**/__mod_extras__.json`, 应当移除
+  该行。它装的是真实可运行的节点定义, 忽略掉等于提交出一个 `next` 指向不存在
+  节点的断链资源包。（已核实: MaaFramework 5.11.1 **会**正常加载 `_` / `__`
+  前缀的 json, 只跳过路径含 `.` 开头组件的文件 —— 所以本地跑得好好的。）
+
+---
+
 ## [0.7.11] — extras 层归属 + V1 输出保真
 
 ### Fixed

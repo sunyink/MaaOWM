@@ -97,19 +97,23 @@ image / model 文件 MaaOWM 不碰，挂载/卸载时原样保留（passthrough�
                                                  存 .maaowm/extras.json
 7.  routing 建立 origin 索引 (task → 原文件) → 存 .maaowm/origin.json
 8.  oracle.canonicalize_overlay(base + mod) → canonical_merged (合并全字段)
-9.  备份当前 mod 包到 .maaowm/<timestamp>/mod/
-10. 清空 mod 的 pipeline 目录
-11. 写文件流水线:
+9.  备份当前 mod 包到 maaowm/.state/mod_og_<timestamp>/
+10. 写文件流水线 (★ 全程纯内存):
       canonical_merged
         → def 剥离 (按 def 表 + 双重判定, 传 canonical_base — 工作区是 base 的 overlay, 见 5.2)
         → V1/V2 转译 (按 output_format)
         → next/on_error 紧凑写法 (按 compact_node_refs)
         → wait_freezes 紧凑写法
         → extras 注入 (doc/desc 塞回每个 task)
+        → routing.group_by_target_file (按 origin 索引定各 task 落点)
         → 按 node_order 重排各文件
-        → routing.write_mod_files (按 origin 索引写回各文件)
+11. 清空 mod 的 pipeline 目录 → routing.write_mod_files 落盘
 12. 写工作区根目录的 __OWM_README__.md
 ```
+
+> **为什么清空排在分组之后**（V0.7.12 调整）：落点分组是这条流水线上唯一会
+> 因数据异常抛错的一步。旧顺序（先清空、再算）一旦抛错，mod 包已被清空而新
+> 产物还没写，只剩备份可救。现在任何异常都停在"mod 包原样未动"的状态。
 
 挂载后，适配包目录里是全字段（但经过 def 剥离精简）的工作区，编辑器可以正常打开。
 
@@ -119,8 +123,10 @@ image / model 文件 MaaOWM 不碰，挂载/卸载时原样保留（passthrough�
 1.  读 config, oracle.init()
 2.  preflight.validate_workspace() — dry-run 加载工作区, 验证没有语法/字段错误
       失败 → 拒绝卸载, 报告错误位置
-3.  备份当前工作区到 .maaowm/<timestamp>/work/
-4.  读 .maaowm/def_tables.json (挂载时存的)
+3.  备份当前工作区到 maaowm/.state/work_<timestamp>/
+3b. 扫工作区节点归属 workspace_origin (task → 它此刻在工作区的哪个文件)
+      纯 JSON 扫描, 不依赖 def 表 → 无条件可得、对 canonical_w 全覆盖
+4.  读 maaowm/.state/def_tables.json (挂载时存的)
 5.  扫工作区原始 JSON, 收集最新 extras + 节点顺序 (用户可能改了 doc/desc)
       ★ 必须在 canonicalize 之前 — oracle 不输出 doc/desc
 6.  oracle.canonicalize(工作区) → canonical_w
@@ -132,9 +138,11 @@ image / model 文件 MaaOWM 不碰，挂载/卸载时原样保留（passthrough�
 10. def 剥离 (带 canonical_base — 双重判定, 见 5.2)
 11. V1/V2 转译 + next/wait_freezes 紧凑写法
 12. extras 注入 (把工作区的 doc/desc 塞回 minimal_mod)
-13. 按 node_order 重排
-14. routing.write_mod_files — 按 origin 索引写回各文件
-15. 清理 .maaowm/ 下的状态文件 (snapshot/origin/def_tables/extras)
+13. routing.group_by_target_file (origin 索引 + workspace_origin 定落点)
+14. 按 node_order 重排
+15. 清空 mod 包 pipeline 目录 → routing.write_mod_files 落盘
+      (10–14 全程纯内存, 理由同挂载端)
+16. 清理 maaowm/.state/ 下的状态文件 (snapshot/origin/def_tables/extras)
       备份保留
 ```
 
@@ -147,7 +155,8 @@ image / model 文件 MaaOWM 不碰，挂载/卸载时原样保留（passthrough�
 | `canonical_w` | 工作区的 canonical | unmount step 6 | 内存 |
 | `def_tables` | 各 type 的默认字段表 | mount step 5 | def_tables.json |
 | `minimal_mod` | diff 出的最小 mod 增量 | unmount step 8 | 内存 (写 mod) |
-| `origin` 索引 | task → 原文件路径 | mount step 7 | origin.json |
+| `origin` 索引 | task → 原文件路径（挂载时快照） | mount step 7 | origin.json |
+| `workspace_origin` | task → 它此刻在工作区的哪个文件 | unmount step 3b | 内存（现扫即用） |
 | `extras` | 非 MaaFW 字段 + 节点顺序 | mount step 6 | extras.json |
 
 ---
@@ -205,7 +214,7 @@ MaaFramework 加载封装——MaaOWM 的"oracle 接口"。`init()` 加载 maa �
 
 格式转换。三块：
 
-- **V1 ↔ V2 转译**：`task_v2_to_v1()` 把嵌套形态拍平成 MaaPipelineEditor 风格。含 `_sub_v2_to_v1()` 递归处理 And/Or 的 sub-recognition。
+- **V1 ↔ V2 转译**：`task_v2_to_v1()` 把嵌套形态拍平成 MaaPipelineEditor 风格。含 `_sub_v2_to_v1()` 递归处理 And/Or 的 sub-recognition。「默认 type 整段省略」需传 base 对照做双重判定（见 [5.2](#52-双重判定剥离) / [7.10](#710-v1默认-type-省略吞掉改回默认的-override双重判定的-type-层)）；两个真实调用点都必须传。
 - **next/on_error 紧凑写法**：`simplify_node_refs_in_pipeline()` 把 `{next: "X"}` 这种 dict 退化成字符串 `"X"`，带 `[JumpBack]`/`[Anchor]` 前缀语法。
 - **wait_freezes 紧凑写法**：`simplify_wait_freezes_in_pipeline()` 把仅含 `time` 一个字段的 `pre_wait_freezes` 退化成标量。
 
@@ -264,6 +273,8 @@ mount / unmount 主流程编排。把上述所有模块串成 [第 3 节](#3-数
 
 **MOD_ONLY 的特例**（V0.7.5 修复）：如果一个 task 在 base 中根本不存在（用户新建的），双重判定的"base 对应字段"取不到值。此时应退化为朴素逻辑——base 没这个 task，等价于 base 全用默认值，按默认值剥即可。否则会因为"base 字段全是 None，永远不等于默认值"导致整个新建 task 一个字段都剥不掉。
 
+**判据同样适用于 type 层**（V0.7.13 修复，见 [7.10](#710-v1默认-type-省略吞掉改回默认的-override双重判定的-type-层)）：V1 输出把「默认 type + 空 param」的 `recognition`/`action` 整段省略，这在 overlay 层里等于"不覆盖"而非"取默认值"——`base=Click, mod=DoNothing` 会因省略被 base 盖回。故 `translator` 也接收 base 对照，同样要求"值是默认 **且** base 也是默认"才省略。这条判据管 param 层（`strip_mod_with_def`）不够，**凡是"因为等于默认值所以不写"的地方都要问一次 base**。
+
 ### 5.3 路 D 递归子字段 diff
 
 MODIFIED task 里，`recognition` / `action` 等是嵌套 dict。朴素的"字段值 != base → 整个写"会导致：用户只改了 `recognition.param.threshold`，结果整个 `recognition` 对象（含十几个没动的子字段）都被写进 mod。
@@ -288,26 +299,38 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 
 注意：这里说的是**节点之间**的顺序（task 在文件里谁先谁后），不是节点内字段的顺序。字段顺序不管（编辑器有自己的排序）。
 
+也要跟"落点"分清：`node_order` 只在**某个文件内部**排序，管不了"这个 task 该进哪个文件"——那是 `routing.decide_target_file()` 的事。这两件事长期各说各话，本节承诺的"新建 task 追加到该文件末尾"曾被 routing 的兜底文件架空，见 [7.9](#79-工作区新建节点被搬进-__mod_extras__json-兜底文件)。
+
 ---
 
-## 6. .maaowm 状态目录
+## 6. maaowm/ 状态目录
 
-挂载期间，适配包目录下会有一个 `.maaowm/` 目录存放状态：
+V3.7.9 起，所有 owm 文件统一到**被管理项目根**的 `maaowm/` 下（更早的版本放在
+适配包目录内的 `.maaowm/`，README 里那条"请 ignore `.maaowm/`"的旧提示已随之
+失效）：
 
 ```
-.maaowm/
-├── snapshot.json        挂载时的 canonical_base + 指纹 (diff 被减数)
-├── origin.json          task → 原文件路径 索引 (写回时用)
-├── def_tables.json      探针出的各 type 默认字段表
-├── extras.json          非 MaaFW 字段 (doc/desc) + 节点顺序 + base 层归属 (base_extras)
-└── <timestamp>/         备份目录 (时间戳命名)
-    ├── mod/             挂载前的 mod 包原貌
-    └── work/            卸载前的工作区原貌
+maaowm/
+├── .gitignore           忽略 .state/ (本地状态不进版本库)
+├── baseline/<分支slug>/ base 基线 base' (进 git 共享, 见 DESIGN-base-baseline.md)
+└── .state/              本地状态与备份 (cfg.owm_dir)
+    ├── snapshot.json        挂载时的 canonical_base + 指纹 (diff 被减数)
+    ├── origin.json          task → 原文件路径 索引 (挂载时快照)
+    ├── def_tables.json      探针出的各 type 默认字段表
+    ├── extras.json          非 MaaFW 字段 (doc/desc) + 节点顺序 + base 层归属 (base_extras)
+    ├── operations.log       挂载/卸载流水
+    ├── mod_og_<ts>/         挂载前的 mod 包原貌
+    └── work_<ts>/           卸载前的工作区原貌
 ```
 
-卸载完成后，前四个状态文件被清理，备份目录保留。`is_mounted()` 通过检测 `snapshot.json` 是否存在来判断挂载状态。
+卸载完成后，前四个状态文件被清理，备份目录与日志保留。`is_mounted()` 通过检测
+`snapshot.json` 是否存在来判断挂载状态。
 
-误操作时，可从 `<timestamp>/` 备份目录手动恢复。
+误操作时，可从 `mod_og_<ts>/` 或 `work_<ts>/` 备份目录手动恢复。
+
+**适配包目录内不产生任何 owm 文件。** 资源包只装能被 MaaFramework 加载的东西，
+owm 自己的记账一律留在 `maaowm/` 下——这是 V0.7.12 删掉 `__mod_extras__.json`
+兜底文件的直接依据（见 [7.9](#79-工作区新建节点被搬进-__mod_extras__json-兜底文件)）。
 
 ---
 
@@ -383,6 +406,122 @@ oracle 输出的 canonical，task 顺序由 dumper 内部决定（非 base 原�
 
 注意语义：mod 作者**显式抄写**的与 base 同值 desc 也会被清——与字段 diff 的 minimal 哲学一致，属有意为之。
 
+### 7.9 工作区新建节点被搬进 `__mod_extras__.json` 兜底文件
+
+**现象**（实例 MFABD2 `feat/EventBattle`，2026-08-07）：开发者在挂载态的工作区
+`EventBattle.json` 里新建节点 `Event_GoinEvent_OcrCk`，紧跟在引用它的
+`Event_GoinEvent` 后面。卸载后该节点**不在** `EventBattle.json` 里，被搬进了适配包
+新生成的 `__mod_extras__.json`；`EventBattle.json` 只剩一句指向它的 `next`。
+再次挂载后仍在那个文件里——开发者手动搬回工作区，下一次卸载又被搬走；在产物上
+手动搬回，下一次挂载又被搬走。`operations.log` 里的指纹是 `files=29 → 30`。
+
+**根因**：`routing.decide_target_file()` 只查两张**挂载时快照**表（`mod_origin` /
+`base_origin`），工作区新建的节点两张表都命中不了，落进硬编码的兜底文件名。
+
+粘死是第二层：兜底文件生成后就躺在适配包里，下次挂载扫 mod 包建 `mod_origin`
+时命中它，而 `mod_origin` 优先级最高——一旦落进去就再也出不来。
+
+**为何拖了这么久**：`decide_target_file()` 返回 `str`，对每个 task 都必须交出一个
+文件名，V3 重构那天写它时只有那两张表可查，兜底文件是当时唯一的解。同日稍晚的
+提交引入 `extras.node_order`（`{文件路径: [task 顺序]}`）后，"这个 task 现在在工作区
+哪个文件"其实已经是现成数据，但它只被拿去排顺序，从没参与落点决策。于是
+[§5.5](#55-节点顺序持久化) 承诺的"工作区新建的 task 追加到该文件末尾"与
+`routing` 的兜底互相矛盾，且 routing 赢——两个承诺隔了一次提交，谁也没发现对方。
+
+**危害**：新建节点与引用它的节点被拆到两个文件，破坏就近可读性；粘死后开发者
+无法用任何手工操作纠正；最严重的是该文件装的是**真实可运行的节点定义**，资源
+项目若把它 gitignore 掉（MFABD2 曾如此），提交出去的就是一个 `next` 指向不存在
+节点的断链资源包。附带一条已核实的反直觉事实：MaaFramework 5.11.1 **会**正常
+加载 `_` / `__` 前缀的 json（`PipelineResMgr::open_and_parse_file` 实测），它只跳过
+路径中含 `.` 开头组件的文件——所以本地跑得好好的，炸只会炸在别人机器上。
+
+**对策**（V0.7.12）：`decide_target_file()` 增加第三级 `workspace_origin`——卸载时
+用 `oracle.list_node_names_with_origin()` 现扫工作区得到的 `{task: 文件相对路径}`。
+它是纯 JSON 扫描、不依赖 def 表，对 `canonical_w` 无条件全覆盖，因此**兜底分支
+和 `EXTRAS_FILENAME` 常量整体删除**，三级全 miss 改抛 `RoutingError`（理论上不可
+达：挂载端 `canonical_merged ⊆ base ∪ mod` 前两级必然命中，卸载端
+`minimal_mod ⊆ canonical_w` 必被第三级覆盖）。
+
+三级的顺序是"旧归属优先于工作区现状"，所以在挂载态**跨文件搬动已有节点仍会被
+撤销**——那是有意保留的，mod 的文件划分继续镜像 base，同名文件对照关系不破。
+只有工作区新建的节点（前两级必然 miss）才会用到第三级。
+
+不写迁移代码：修复后不再产生该文件，存量由使用者删一次即可。
+
+配套调整：既然落点决策成了写盘流水线上唯一会抛错的一步，`_clean_pipeline_dir()`
+从"分组之前"移到"分组之后、落盘之前"，挂载卸载两端一致。异常不再留下一个空的
+pipeline 目录。
+
+### 7.10 V1「默认 type 省略」吞掉改回默认的 override（双重判定的 type 层）
+
+**现象**（实例 MFABD2 `Event_GoinEvent`，2026-08-09）：base 是 `recognition: And`
++ `action: Click` + `target: [1118,387]`。开发者在挂载态工作区把 `action` 改成
+`DoNothing`（意图：这个节点只识别不点，base 那个坐标已被促销横幅占用成盲点，改由
+下游 `Event_GoinEvent_OcrCk` 真点）。卸载后适配包里该节点**没有 action** —— 只剩
+`desc`/`post_delay`/`timeout`/`next`/`on_error`。运行时 [base, pc] 合并，`action`
+沿用 base 的 `Click`，盲点照点不误，而 desc 还写着"由 OcrCk 救援腿真点"。
+反复改、反复丢：每次挂载工作区都显示回 `Click`。
+
+**根因**：`translator.task_v2_to_v1()` 的 V1 输出规则 3「type 是默认值且 param
+为空 → 整段省略」。这条规则依赖的等价关系「V1 里省略 recognition/action ≡ 该字段
+取框架默认值」，只对**独立完整节点**成立。本工具的两个产物都不是独立节点，而是
+overlay 的一层——在层里省略的语义是"不覆盖"，不是"取默认值"：
+
+| 产物 | 运行时 | 省略 `action` 的真实后果 |
+| --- | --- | --- |
+| 卸载 → mod delta | [base, mod] 字段级合并 | 沿用 base 的 `Click` |
+| 挂载 → 挂载态工作区 | [base, 工作区] 字段级合并（in-place） | 沿用 base 的 `Click` |
+
+具体到卸载链路：diff 出的 delta 里 `action` = `{"type":"DoNothing","param":{}}`，
+def 剥离把空 `param` 删掉（`DoNothing` 的 param 默认表就是 `{}`，删了不损语义），
+只剩 `{"type":"DoNothing"}` 交给 translator —— 正好命中「默认 type + 空 param」，
+整段蒸发。**def 剥离那一步是对的，丢信息的是 translator。**
+
+与 §7.3 / §7.6 / §7.7 是同一族的第四例：双重判定做到了 **param 层**，漏了
+**type 层**，而且做判定的地方（`def_table`）与执行省略的地方（`translator`）分离，
+后者手上根本没有 base 可对照。
+
+**顺带一个更隐蔽的变体**：mod 里原本手写着 `"action": "DoNothing"`（bug 引入前
+写的），挂载时 `canonical_merged.action` = `DoNothing` → translator 省略 → 工作区
+无 `action`；挂载态运行 base 的 `Click` 已经盖回（§7.7 同款）；用户一个字没改直接
+卸载，工作区独立 canonicalize 得 `DoNothing`，与 base `Click` 不等 → 进 delta →
+再被省略。**一次 mount/unmount 空转就能把 mod 里手写的 `DoNothing` 永久抹掉。**
+
+**对策**（V0.7.13）：`task_v2_to_v1(base_task=)` / `pipeline_v2_to_v1(canonical_base=)`
+接收 base 对照，省略需同时满足
+
+1. 当前 type == 默认 type 且 param 为空
+2. base 同字段 type 也是默认（或 base 无此 task / 无此字段）
+
+挂载卸载两端都传。`base_task=None` 同时表示"MOD_ONLY"和"调用方没给对照"，两者期望
+行为一致（都允许省略），故不冲突；批量入口另传 `has_base_ref` 把这两种情形分开，
+让 MOD_ONLY 走"允许省略"而不是"无对照"。不传对照时退化为旧行为，纯格式转换的直调
+不受影响。
+
+**为何一直没被发现**：`translator._self_test` 的 case 2/3/4 恰恰在测"省略"，用的全
+是独立节点视角——测试本身就建立在同一个错误前提上（与 §7.7 里 `verify_workspace_
+minimal*.py` 踩进"独立加载"前提是同一种失效）。且触发口很窄：要 base 该字段是非默认
+type、而 mod 恰好改回默认 type。`Click`→`DoNothing`、`And`/`OCR`→`DirectHit` 是仅有
+的两条路径。
+
+**V2 输出模式不受影响**：不走 translator，`{"type":"DoNothing"}` 直接落盘，
+`action` 字段在 mod 里存在，就不会沿用 base。这个 bug 是 V1 输出独有的。
+
+**实测**（MaaFW 5.11.1，`canonicalize_overlay(base, mod)`，base 为 `And` +
+`Click[1118,387]`）：
+
+| mod 里的 `action` | 合并后 `action.type` | 合并后 `action.param` |
+| --- | --- | --- |
+| 省略（bug 产物） | `Click` | `target: [1118,387,1,1]`（base 的盲点） |
+| `"DoNothing"`（V1，修复产物） | `DoNothing` | `{}` |
+| `{"type":"DoNothing"}`（V2） | `DoNothing` | `{}` |
+
+注意第二三行的 `param` 是**空的**，不是 base 的 `target` 残留——`recognition`/
+`action` 换 type 时 MaaFW 走的是**整体替换**，param 按新 type 重置，不与 base 的旧
+type param 做 dict-merge。所以 mod 只写一个 type 名就足够干净地改写动作，不需要连
+带清理 base 的参数字段。（`_ATOMIC_DICT_KEYS` 里 `custom_action_param` 那条讲的是
+同一 type 内部的 param 子字段整体替换，与这里是两回事。）
+
 ### 其他较小的修复
 
 - 空 mod 目录导致 oracle 加载失败 → 检测空 mod 跳过加载
@@ -433,6 +572,15 @@ V3.7.11 extras 层归属 (base_extras) — 卸载注入按 base 归属过滤, �
         desc 泄漏进 mod (见 7.8); V1 输出解包单元素 Swipe/MultiSwipe end
         (dumper 5.10 目标数组包裹拍回平坦形态); 移除 sub_name==type 主动
         删除 (sub_name 永远保留)。
+V3.7.12 落点第三级 workspace_origin — 工作区新建节点写回它所在的原文件,
+        __mod_extras__.json 兜底整体删除 (见 7.9)。适配包内不再生成任何
+        owm 文件。配套: 清空 pipeline 目录推迟到分组之后, 落点抛错不再
+        留下空目录。
+V3.7.13 双重判定推进到 type 层 — 修 V1「默认 type 省略」吞掉"改回默认 type"
+        的 override (见 7.10, 实例 Event_GoinEvent: base Click、工作区改
+        DoNothing, 卸载后 action 整段消失, 运行时 base 的 Click 盖回)。
+        translator 收 base 对照, 挂载卸载两端都传; base 同字段也是默认时
+        才省略。def 剥离侧无需改动 — 丢信息的是 V1 输出, 不是剥离。
 ```
 
 每一步都是被实际问题驱动的，不是预先规划的路线图。V3 整体方法论：设计先讨论清楚再写代码（V2 的教训），每个改动配自检，重要假设用 verify 脚本实证而非推理。
@@ -479,7 +627,7 @@ python -m core.env_check      # venv 识别 case
 ### 改代码的注意事项
 
 - **不要重新实现 MaaFramework 的语义**。这是 V2 的死因。任何"判断字段该不该这样"的问题，答案应该来自 oracle，不是来自你写的规则。
-- **def 剥离的双重判定不能简化**。挂载端不传 base、卸载端传 base、MOD_ONLY 退化——这三种情况各有原因（见 [5.2](#52-双重判定剥离)），看起来啰嗦但都是踩过坑的。
+- **双重判定不能简化**。挂载端与卸载端都传 base、MOD_ONLY 退化朴素、type 漂移退化朴素——每种情况各有原因（见 [5.2](#52-双重判定剥离)），看起来啰嗦但都是踩过坑的。**判据不止管 def 剥离**：凡是"因为等于默认值所以不写这个字段"的地方（`strip_mod_with_def` 的 param 层、`translator` 的 type 层）都要先问一次 base，产物是 overlay 的一层，不写等于不覆盖，不等于取默认值。
 - **extras 收集必须在 canonicalize 之前**。oracle 不输出 doc/desc，一旦 canonicalize 就丢了。
 - **改剥离逻辑后跑 verify 脚本**。剥离是否安全（round-trip 是否闭合）要用真实数据实证，不能靠推理。
 
@@ -495,4 +643,4 @@ V3 的核心不是某个算法，是**承认自己不是权威，把权威让给
 
 ---
 
-*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.11。*
+*本文档随 MaaOWM V3 维护。最后更新对应版本 V3.7.12。*

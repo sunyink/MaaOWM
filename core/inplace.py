@@ -1,27 +1,35 @@
 """
 core/inplace.py — 挂载 / 卸载主流程
 
+状态文件都在 cfg.owm_dir, 即被管理项目根的 maaowm/.state/ (V3.7.9 起;
+更早的版本放在适配包目录下的 .maaowm/)。
+
 挂载 (mount):
-  1. 检测 mod 包当前状态, 备份原 mod  (.maaowm/mod_og_<ts>/)
+  1. 检测 mod 包当前状态, 备份原 mod  (maaowm/.state/mod_og_<ts>/)
   2. canonicalize(base_layers) → canonical_base
-  3. 写快照 .maaowm/snapshot.json
+  3. 写快照 snapshot.json
   4. canonicalize_overlay(base_layers + mod) → canonical_merged (mount 内容)
-  5. 建 origin 索引 .maaowm/origin.json
-  6. 清空 mod 包的 pipeline 目录
-  7. 按 origin 分组写入 canonical_merged → workspace
+  5. 建 origin 索引 origin.json
+  6. 按 origin 分组 canonical_merged (纯内存)
+  7. 清空 mod 包的 pipeline 目录 → 写入工作区
   8. 写 __OWM_README__.md 提醒纪律
 
 卸载 (unmount):
-  1. 检测挂载状态 (.maaowm/snapshot.json 存在)
-  2. 备份当前 workspace  (.maaowm/work_<ts>/)
-  3. canonicalize(workspace) → canonical_w
-  4. 读 snapshot → canonical_base
-  5. compute_minimal_mod(canonical_w, canonical_base) → minimal_mod
-  6. 读 origin 索引
-  7. 清空 mod 包 pipeline 目录
-  8. 按 origin 分组写 minimal_mod → mod
-  9. 删除 snapshot 和 origin 索引 (挂载状态结束)
-  10. 留下日志, 备份保留供恢复
+  1. 检测挂载状态 (snapshot.json 存在)
+  2. 备份当前 workspace  (maaowm/.state/work_<ts>/)
+  3. 扫工作区节点归属 (workspace_origin) 与 extras / node_order
+  4. canonicalize(workspace) → canonical_w
+  5. 读 snapshot → canonical_base
+  6. compute_minimal_mod(canonical_w, canonical_base) → minimal_mod
+  7. 读 origin 索引
+  8. 按 origin + workspace_origin 分组 minimal_mod (纯内存)
+  9. 清空 mod 包 pipeline 目录 → 写入 minimal_mod
+  10. 删除 snapshot 和 origin 索引 (挂载状态结束)
+  11. 留下日志, 备份保留供恢复
+
+★ V0.7.12: 6/8 两步的分组从"清空之后"提到了"清空之前"。分组是整条写盘
+  流水线上唯一会因数据异常抛错的一步 (routing.RoutingError), 旧顺序下抛错
+  会留下一个空的 pipeline 目录, 只剩备份可救。
 """
 
 from __future__ import annotations
@@ -486,12 +494,9 @@ def mount(
     (cfg.owm_dir / ORIGIN_INDEX_FILENAME).write_text(index.to_json(), encoding="utf-8")
     cb(f"  origin 索引: base {len(base_origin)} / mod {len(mod_origin)}")
 
-    # 清空 mod 的 pipeline 目录, 写入合并 canonical
-    cb("清空 mod 包 pipeline 目录, 写入 canonical 工作区...")
-    cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
-    cb(f"  清理: {cleaned} 旧文件")
-
-    # 流水线: canonical → def 剥离 → V1 转译 → next 紧凑 → 写文件
+    # 流水线 (V0.7.12: 全程纯内存, 清空 mod 目录推迟到落盘前一刻 —— 与卸载端
+    # 同理, 让落点决策等可能抛错的步骤都停在"mod 包原样未动"的状态)
+    # canonical → def 剥离 → V1 转译 → next 紧凑 → 分组 → 清空 → 写文件
     # 顺序约束:
     #   - def 剥离必须在 V1 转译之前 (strip 按 V2 type 查表)
     #   - next 紧凑独立, 放最后或最前都行 (放最后省一次遍历)
@@ -519,9 +524,15 @@ def mount(
     cb(f"  剥离 {stripped} 个 def 字段")
 
     # V1/V2 输出选择
+    # ★ V0.7.13: 传 canonical_base —— V1 的「默认 type 整段省略」也要双重判定。
+    #   工作区是 base 的 overlay 层 (同 §7.7 的 def 剥离), 省略等于"不覆盖"而非
+    #   "取默认值"。base 是 Click、mod 覆盖成 DoNothing 时若裸省略, 挂载态运行
+    #   base 的 Click 会透过合并盖回, mod 的 DoNothing 被静默吞掉。
     if cfg.output_format == "v1":
         cb("  转 V1 格式 (按 MPE 风格拍平)...")
-        pipeline_to_write = translator.pipeline_v2_to_v1(pipeline_to_write)
+        pipeline_to_write = translator.pipeline_v2_to_v1(
+            pipeline_to_write, canonical_base=canonical_base,
+        )
 
     # next/on_error 紧凑写法 (默认开启, 与 V1/V2 正交)
     if cfg.compact_node_refs:
@@ -539,6 +550,9 @@ def mount(
     injected = extras_mod.inject_extras_into_pipeline(pipeline_to_write, extras_snap)
     cb(f"  注入 {injected} 个 extras 字段")
 
+    # 落点分组: 挂载端路由 canonical_merged ⊆ base ∪ mod, 前两级必然命中,
+    # 故不传 workspace_origin (工作区此刻还是挂载前的 mod 包原貌)
+    cb("  决定各 task 落点文件...")
     grouped = routing.group_by_target_file(pipeline_to_write, index)
 
     # 节点顺序重排 (V0.7.0): 每个文件按 base 中记录的顺序重排 task
@@ -547,6 +561,11 @@ def mount(
         rel: extras_mod.reorder_pipeline_by_node_order(p, rel, extras_snap.node_order)
         for rel, p in grouped.items()
     }
+
+    # ── 落盘 (到此为止全是内存操作, 出错不会留下残缺 mod 包) ──
+    cb("清空 mod 包 pipeline 目录, 写入 canonical 工作区...")
+    cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
+    cb(f"  清理: {cleaned} 旧文件")
 
     written = routing.write_mod_files(grouped_reordered, cfg.workspace_pipeline_dir())
     fmt_label = cfg.output_format.upper()
@@ -607,6 +626,18 @@ def unmount(
     work_backup = _backup_dir(cfg, "work")
     work_count = _copy_pipeline_only(cfg.workspace_pipeline_dir(), work_backup / cfg.pipeline_subdir)
     cb(f"  备份: {work_backup.name} ({work_count} 文件)")
+
+    # 工作区归属 (V0.7.12): task → 它此刻在工作区的哪个文件, 落点决策的第三级。
+    # 工作区新建的 task 靠它写回自己所在的文件, 取代旧的 __mod_extras__.json 兜底。
+    # 纯 JSON 扫描, 不依赖 def 表 (与下面的 extras 采集不同), 故无条件可得、
+    # 对 canonical_w 全覆盖 —— 这正是兜底文件可以整体删掉的前提。
+    cb("扫描工作区节点归属...")
+    ws_pipeline_dir = cfg.workspace_pipeline_dir()
+    workspace_origin: Dict[str, str] = {
+        name: path.relative_to(ws_pipeline_dir).as_posix()
+        for name, path in oracle.list_node_names_with_origin(ws_pipeline_dir).items()
+    }
+    cb(f"  归属: {len(workspace_origin)} task")
 
     # 读 def 表 (挂载时存的, 用于扫描 extras 字段判定)
     def_path = cfg.owm_dir / DEF_TABLES_FILENAME
@@ -722,16 +753,23 @@ def unmount(
                     base_origin[name] = path.relative_to(bp).as_posix()
         index = routing.OriginIndex(mod_origin={}, base_origin=base_origin)
 
-    # 清空 mod, 写 minimal_mod
-    cb("清空 mod 包 pipeline 目录, 写入 minimal mod...")
-    cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
-    cb(f"  清理: {cleaned} 文件")
+    # 产物流水线 (V0.7.12: 全程纯内存, 清空 pipeline 目录推迟到落盘前一刻)
+    #   落点决策是这条流水线上唯一会因数据异常抛错的一步 (routing.RoutingError)。
+    #   旧顺序先清空再分组, 一旦抛错工作区已空、新产物又没写 —— 只剩备份可救。
+    #   现在算完再清, 任何异常都停在"工作区原样未动"的状态。
+    cb("计算 minimal mod 产物...")
 
     # V1/V2 输出选择
+    # ★ V0.7.13: 传 canonical_base —— minimal mod 是 delta, V1 的「默认 type
+    #   整段省略」在 delta 里语义是"不覆盖"而非"取默认值"。base 是 Click、工作区
+    #   改成 DoNothing 时, delta 的 action 只剩 {"type":"DoNothing"} (空 param 已
+    #   被 def 剥离), 裸省略会让整个 action 从 mod 消失, 加载后沿用 base 的 Click。
     minimal_to_write = diff_result.minimal_mod
     if cfg.output_format == "v1":
         cb("  转 V1 格式 (按 MPE 风格拍平)...")
-        minimal_to_write = translator.pipeline_v2_to_v1(diff_result.minimal_mod)
+        minimal_to_write = translator.pipeline_v2_to_v1(
+            diff_result.minimal_mod, canonical_base=canonical_base,
+        )
 
     # next/on_error 紧凑写法
     if cfg.compact_node_refs:
@@ -768,7 +806,10 @@ def unmount(
         if dropped:
             cb(f"  剔除 {len(dropped)} 个过滤后为空的 task")
 
-    grouped = routing.group_by_target_file(minimal_to_write, index)
+    # 落点分组 (V0.7.12): 第三级 workspace_origin —— 工作区新建的 task 写回
+    # 它在工作区所在的文件, 而不是塞进 __mod_extras__.json (该兜底已删除)
+    cb("  决定各 task 落点文件...")
+    grouped = routing.group_by_target_file(minimal_to_write, index, workspace_origin)
 
     # 节点顺序重排 (V0.7.0): 用 workspace 的 node_order
     # mod 中 task 的顺序参照工作区, 避免 hash 序意外暴露
@@ -778,6 +819,11 @@ def unmount(
             rel: extras_mod.reorder_pipeline_by_node_order(p, rel, workspace_node_order)
             for rel, p in grouped.items()
         }
+
+    # ── 落盘 (到此为止全是内存操作, 出错不会留下残缺工作区) ──
+    cb("清空 mod 包 pipeline 目录, 写入 minimal mod...")
+    cleaned = _clean_pipeline_dir(cfg.workspace_pipeline_dir())
+    cb(f"  清理: {cleaned} 文件")
 
     written = routing.write_mod_files(grouped, cfg.workspace_pipeline_dir())
     fmt_label = cfg.output_format.upper()

@@ -10,23 +10,80 @@ V1 输出规则:
   2. action.type → 顶层 "action" 字符串
      action.param.* → 拍平到 task 顶层
   3. type 是默认值且 param 为空 → 整段省略 (DirectHit / DoNothing)
+     ★ 仅当 base 同字段的 type 也是默认时才省略 — 见下方"默认省略的边界"
   4. 其他 task 顶层字段 (next/timeout/post_delay/...) 不变
 
 可逆性:
   V1 → V2: parser 自动还原 (V1/V2 信息容量等价, 因为 reco/action 字段名空间不冲突)
   V2 → V1: 本函数实现, 拍平到 task 顶层, 字段顺序由调用方 (或编辑器) 处理
+
+默认省略的边界 (V0.7.13):
+  规则 3 的等价关系"V1 省略 recognition/action ≡ 该字段取框架默认值"只对
+  **独立完整节点**成立。本工具的两个产物都不是独立节点, 而是 overlay 的一层:
+    - 卸载产物 = mod delta        (运行时 [base, mod] 字段级合并)
+    - 挂载产物 = 挂载态工作区      (运行时 [base, 工作区] 字段级合并, in-place)
+  在这两层里省略的语义是"不覆盖", 不是"取默认值"。若 base 该字段是非默认
+  type、而用户恰恰把它改回默认 type (Click→DoNothing / And→DirectHit),
+  裸省略会让 base 的旧 type 透过合并盖回来, 改动被静默吞掉。
+  故调用方须传 base 对照 (task_v2_to_v1(base_task=) / pipeline_v2_to_v1
+  (canonical_base=)), 仅当 base 同字段 type 也是默认 (或 base 无此 task /
+  此字段) 时才省略。这是 def 剥离"双重判定"(见 ARCHITECTURE 5.2) 在 type
+  层的同款判据 — 早期只在 param 层做了, type 层漏了。
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 # 默认 type — V1 模式下若 type 为这些且 param 为空, 整段省略
 DEFAULT_RECO_TYPE = "DirectHit"
 DEFAULT_ACTION_TYPE = "DoNothing"
+
+
+def _base_field_type(base_task: Any, field: str) -> Any:
+    """取 base 同 task 的 recognition/action type。
+
+    base_task 为 None、无该字段、字段形态异常 → None, 语义是"base 没在这个
+    字段上表态", 与 base 用默认 type 等价 (对齐 strip_mod_with_def 的
+    MOD_ONLY 退化, 见 ARCHITECTURE 7.4)。
+    """
+    if not isinstance(base_task, dict):
+        return None
+    v = base_task.get(field)
+    if isinstance(v, dict):
+        return v.get("type")
+    if isinstance(v, str):
+        return v            # base 已是 V1 形态时的兜底
+    return None
+
+
+def _may_omit_default_type(
+    cur_type: Any,
+    cur_param: Any,
+    default_type: str,
+    base_task: Any,
+    field: str,
+    has_base_ref: bool,
+) -> bool:
+    """判定「默认 type + 空 param」能否整段省略 (V0.7.13 type 层双重判定)。
+
+    两条都成立才省略:
+      1. 当前 type == 默认 type 且 param 为空
+      2. base 同字段 type 也是默认 (或 base 无此 task / 此字段)
+
+    has_base_ref=False (调用方未传 base 对照) → 退化为旧行为, 只看条件 1。
+    产物是独立完整节点时才该走这条路; 产物是 overlay 的一层时必须传 base,
+    否则"改回默认 type"的 override 会被 base 值盖回 (见模块 docstring)。
+    """
+    if cur_type != default_type or cur_param:
+        return False
+    if not has_base_ref:
+        return True
+    b_type = _base_field_type(base_task, field)
+    return b_type is None or b_type == default_type
 
 
 def _unwrap_single_target_array(v: Any) -> Any:
@@ -82,11 +139,24 @@ def _sub_v2_to_v1(sub: Any) -> Any:
     return out
 
 
-def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
+def task_v2_to_v1(
+    task_v2: Dict[str, Any],
+    base_task: Optional[Dict[str, Any]] = None,
+    has_base_ref: Optional[bool] = None,
+) -> Dict[str, Any]:
     """把单个 V2 task 转换为 V1 形态。
 
     输入: V2 task dict (可能是 minimal mod 的一个 task, 也可能是工作区某个 task)
     输出: V1 task dict (字段拍平到顶层)
+
+    base_task (V0.7.13): 该 task 在 canonical_base 中的对应定义 (V2 形态),
+      用于「默认 type 整段省略」的双重判定。产物是 overlay 的一层 (mod delta /
+      挂载态工作区) 时必须提供对照, 否则"把非默认 type 改回默认"的改动会因省略
+      被 base 盖回 (见模块 docstring「默认省略的边界」)。
+      base 里没有该 task (MOD_ONLY) 时传 None + has_base_ref=True。
+    has_base_ref: 显式声明"调用方有 base 可对照"。默认 None = 由 base_task
+      是否为 None 推断, 满足单 task 直调的直觉; 批量转换由 pipeline_v2_to_v1
+      显式传 True, 好让 MOD_ONLY task 走"允许省略"而不是"无对照"。
 
     转换不应损失信息 — 因为 reco/action 字段名空间不冲突。
     若调用方传入了不规范的 V2 dict (含同名字段)、本函数仍以 task 原顶层字段优先,
@@ -94,6 +164,9 @@ def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(task_v2, dict):
         return task_v2
+
+    if has_base_ref is None:
+        has_base_ref = base_task is not None
 
     out: Dict[str, Any] = {}
 
@@ -109,7 +182,9 @@ def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
         r_type = reco.get("type")
         r_param = reco.get("param", {}) or {}
 
-        is_default = (r_type == DEFAULT_RECO_TYPE) and not r_param
+        is_default = _may_omit_default_type(
+            r_type, r_param, DEFAULT_RECO_TYPE, base_task, "recognition", has_base_ref,
+        )
         if not is_default:
             if r_type:
                 out["recognition"] = r_type
@@ -131,7 +206,9 @@ def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
         a_type = act.get("type")
         a_param = act.get("param", {}) or {}
 
-        is_default = (a_type == DEFAULT_ACTION_TYPE) and not a_param
+        is_default = _may_omit_default_type(
+            a_type, a_param, DEFAULT_ACTION_TYPE, base_task, "action", has_base_ref,
+        )
         if not is_default:
             if a_type:
                 out["action"] = a_type
@@ -157,11 +234,22 @@ def task_v2_to_v1(task_v2: Dict[str, Any]) -> Dict[str, Any]:
 
 def pipeline_v2_to_v1(
     pipeline_v2: Dict[str, Dict[str, Any]],
+    canonical_base: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """整个 pipeline 文件 (含多个 task) 的 V2 → V1 转换。
     用于 mount 写工作区或 unmount 写 mod 时的批量转换。
+
+    canonical_base (V0.7.13): base 的 canonical。两个真实调用点 (挂载写工作区 /
+    卸载写 mod) 的产物都是 overlay 的一层, **都必须传** — 不传则「默认 type 整段
+    省略」会吞掉"改回默认 type"的 override (见模块 docstring)。
+    参数保持可选只为兼容纯格式转换的直调 (如自检里的独立节点用例)。
     """
-    return {name: task_v2_to_v1(td) for name, td in pipeline_v2.items()}
+    has_base_ref = canonical_base is not None
+    base_map = canonical_base or {}
+    return {
+        name: task_v2_to_v1(td, base_map.get(name), has_base_ref=has_base_ref)
+        for name, td in pipeline_v2.items()
+    }
 
 
 # ============================================================
@@ -643,6 +731,117 @@ def _self_test() -> bool:
             print(f"  ✗ case {i}: {name}")
             print(f"      期望: {json.dumps(expected, ensure_ascii=False)}")
             print(f"      实际: {json.dumps(actual, ensure_ascii=False)}")
+
+    # ============================================================
+    # 默认 type 省略的双重判定 (V0.7.13) — overlay 层不能裸省略
+    # ============================================================
+    print()
+    print("translator 自检 (默认 type 省略 · 双重判定)")
+    print("─" * 60)
+
+    # 实例原型: MFABD2 Event_GoinEvent — base 是 And + Click[1118,387],
+    # 挂载态改成 DoNothing 后卸载, action 整个从 mod 消失 (加载后沿用 base 的 Click)
+    _BASE_AND_CLICK = {
+        "Event_GoinEvent": {
+            "recognition": {"type": "And", "param": {
+                "all_of": ["Rec_HomePage_GA_Ocr", "Rec_HomePage_GA_Clr"],
+            }},
+            "action": {"type": "Click", "param": {"target": [1118, 387]}},
+            "post_delay": 8000,
+        }
+    }
+
+    # (name, pipeline_in, canonical_base, expected)
+    dual_cases = [
+        (
+            "base=Click, delta=DoNothing → 必须写出 action",
+            {"Event_GoinEvent": {
+                "action": {"type": "DoNothing"},   # 空 param 已被 def 剥离
+                "post_delay": 200,
+                "next": ["Event_GoinEvent_OcrCk"],
+            }},
+            _BASE_AND_CLICK,
+            {"Event_GoinEvent": {
+                "post_delay": 200,
+                "next": ["Event_GoinEvent_OcrCk"],
+                "action": "DoNothing",
+            }},
+        ),
+        (
+            "base=And, delta=DirectHit → 必须写出 recognition",
+            {"Event_GoinEvent": {"recognition": {"type": "DirectHit", "param": {}}}},
+            _BASE_AND_CLICK,
+            {"Event_GoinEvent": {"recognition": "DirectHit"}},
+        ),
+        (
+            "base 同字段也是默认 → 照旧省略 (不矫枉过正)",
+            {"T": {"action": {"type": "DoNothing", "param": {}}, "next": ["X"]}},
+            {"T": {"action": {"type": "DoNothing", "param": {}}, "next": []}},
+            {"T": {"next": ["X"]}},
+        ),
+        (
+            "base 无此字段 → 视作 base 用默认, 省略",
+            {"T": {"action": {"type": "DoNothing", "param": {}}, "next": ["X"]}},
+            {"T": {"next": []}},
+            {"T": {"next": ["X"]}},
+        ),
+        (
+            "MOD_ONLY (base 无此 task) → 整段是完整节点, 省略",
+            {"NewTask": {
+                "recognition": {"type": "DirectHit", "param": {}},
+                "action": {"type": "DoNothing", "param": {}},
+                "next": ["X"],
+            }},
+            _BASE_AND_CLICK,          # 不含 NewTask
+            {"NewTask": {"next": ["X"]}},
+        ),
+        (
+            "挂载端: 工作区完整节点 (base=Click, merged=DoNothing) → 写出",
+            {"Event_GoinEvent": {
+                "recognition": {"type": "And", "param": {
+                    "all_of": ["Rec_HomePage_GA_Ocr", "Rec_HomePage_GA_Clr"],
+                }},
+                "action": {"type": "DoNothing", "param": {}},
+                "post_delay": 200,
+            }},
+            _BASE_AND_CLICK,
+            {"Event_GoinEvent": {
+                "post_delay": 200,
+                "recognition": "And",
+                "all_of": ["Rec_HomePage_GA_Ocr", "Rec_HomePage_GA_Clr"],
+                "action": "DoNothing",
+            }},
+        ),
+        (
+            "delta 只有 param 无 type (type 沿用 base) → 不写 action 字符串",
+            {"Event_GoinEvent": {"action": {"param": {"target": [100, 200]}}}},
+            _BASE_AND_CLICK,
+            {"Event_GoinEvent": {"target": [100, 200]}},
+        ),
+    ]
+
+    for name, pin, cbase, expected in dual_cases:
+        actual = pipeline_v2_to_v1(pin, canonical_base=cbase)
+        if actual == expected:
+            print(f"  ✓ {name}")
+        else:
+            all_ok = False
+            print(f"  ✗ {name}")
+            print(f"      期望: {json.dumps(expected, ensure_ascii=False)}")
+            print(f"      实际: {json.dumps(actual, ensure_ascii=False)}")
+
+    # 不传 base 对照 → 退化旧行为 (向后兼容, 纯格式转换直调走这条)
+    _no_base_in = {"T": {"action": {"type": "DoNothing", "param": {}}, "next": ["X"]}}
+    for label, actual in (
+        ("pipeline_v2_to_v1 不传 canonical_base", pipeline_v2_to_v1(_no_base_in)),
+        ("task_v2_to_v1 不传 base_task",
+         {"T": task_v2_to_v1(_no_base_in["T"])}),
+    ):
+        if actual == {"T": {"next": ["X"]}}:
+            print(f"  ✓ {label} → 旧行为省略")
+        else:
+            all_ok = False
+            print(f"  ✗ {label}: {json.dumps(actual, ensure_ascii=False)}")
 
     # ============================================================
     # next/on_error 紧凑写法测试
